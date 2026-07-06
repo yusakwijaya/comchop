@@ -1,7 +1,7 @@
 import React, { useCallback, useState, useRef } from 'react'
 
 interface Props {
-  onUpload: (file: File) => void
+  onUpload: (files: File[]) => void
   isProcessing: boolean
 }
 
@@ -11,27 +11,32 @@ export default function ComicUploader({ onUpload, isProcessing }: Props) {
   const [fileName, setFileName] = useState<string | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
-  const handleFile = useCallback((file: File) => {
-    if (!file.type.startsWith('image/')) return
-    setFileName(file.name)
-    const reader = new FileReader()
-    reader.onload = (e) => setPreview(e.target?.result as string)
-    reader.readAsDataURL(file)
-    onUpload(file)
+  const handleFiles = useCallback((files: File[]) => {
+    const images = files.filter(f => f.type.startsWith('image/'))
+    if (images.length === 0) return
+
+    if (images.length === 1) {
+      setFileName(images[0].name)
+      const reader = new FileReader()
+      reader.onload = (e) => setPreview(e.target?.result as string)
+      reader.readAsDataURL(images[0])
+    } else {
+      setFileName(`${images.length} comics selected`)
+      setPreview(null)
+    }
+    onUpload(images)
   }, [onUpload])
 
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault()
     setIsDragging(false)
-    const file = e.dataTransfer.files[0]
-    if (file) handleFile(file)
-  }, [handleFile])
+    handleFiles(Array.from(e.dataTransfer.files))
+  }, [handleFiles])
 
   const onDragOver = (e: React.DragEvent) => { e.preventDefault(); setIsDragging(true) }
   const onDragLeave = () => setIsDragging(false)
   const onInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (file) handleFile(file)
+    handleFiles(Array.from(e.target.files ?? []))
   }
 
   const handleSampleLoad = async (e: React.MouseEvent) => {
@@ -40,7 +45,7 @@ export default function ComicUploader({ onUpload, isProcessing }: Props) {
       const response = await fetch('/comic_grid.png')
       const blob = await response.blob()
       const file = new File([blob], 'comic_grid.png', { type: 'image/png' })
-      handleFile(file)
+      handleFiles([file])
     } catch (err) {
       console.error("Failed to load sample image", err)
     }
@@ -66,6 +71,7 @@ export default function ComicUploader({ onUpload, isProcessing }: Props) {
           id="comic-file-input"
           type="file"
           accept="image/*"
+          multiple
           className="hidden"
           onChange={onInputChange}
           disabled={isProcessing}
@@ -101,7 +107,7 @@ export default function ComicUploader({ onUpload, isProcessing }: Props) {
                 {isDragging ? 'Release to analyse' : 'Drop your comic here'}
               </p>
               <p className="text-sm text-surface-200/50 mt-1">
-                PNG · JPG · WebP · up to 30 MB
+                PNG · JPG · WebP · up to 30 MB · multiple files supported
               </p>
             </div>
             <div className="flex gap-3">
