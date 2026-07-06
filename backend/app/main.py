@@ -13,6 +13,9 @@ from pydantic import BaseModel
 
 from app.services.splitter import SplitResult, split_panels
 
+MAX_UPLOAD_BYTES = 30 * 1024 * 1024  # 30 MB
+MAX_BATCH_FILES = 20
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -47,6 +50,23 @@ class SplitResponse(BaseModel):
     grid: list[tuple[int, int]]
     metadata: dict
     processing_time_ms: float
+
+
+class ComicSplitResult(BaseModel):
+    filename: str
+    status: str                        # "ok" | "error"
+    panels: list[str] = []
+    rows: int = 0
+    cols: int = 0
+    grid: list[tuple[int, int]] = []
+    metadata: dict = {}
+    processing_time_ms: float = 0.0
+    error: str | None = None
+
+
+class BatchSplitResponse(BaseModel):
+    results: list[ComicSplitResult]
+    total_processing_time_ms: float
 
 
 class HealthResponse(BaseModel):
@@ -87,7 +107,7 @@ async def split_comic(
         raise HTTPException(status_code=400, detail="File must be an image.")
 
     image_bytes = await file.read()
-    if len(image_bytes) > 30 * 1024 * 1024:  # 30 MB guard
+    if len(image_bytes) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Image must be under 30 MB.")
 
     t0 = time.perf_counter()
@@ -128,4 +148,99 @@ async def split_comic(
         grid=result.grid,
         metadata=result.metadata,
         processing_time_ms=round(elapsed_ms, 2),
+    )
+
+
+@app.post("/api/split-batch", response_model=BatchSplitResponse, tags=["Splitter"])
+async def split_comics_batch(
+    files: list[UploadFile] = File(..., description="Multiple comic images (PNG / JPG / WebP)"),
+    binary_threshold: int = Form(240, ge=200, le=255),
+    white_threshold: float = Form(0.99, ge=0.8, le=1.0),
+    min_panel_ratio: float = Form(0.15, ge=0.05, le=0.5),
+    detect_divider_lines: bool = Form(True),
+    dark_threshold: int = Form(70, ge=0, le=150),
+    line_std_threshold: float = Form(18.0, ge=0.0, le=60.0),
+) -> BatchSplitResponse:
+    """
+    Upload multiple comic images and receive panels for each, kept separate
+    per source file (not merged into one flat list).
+    """
+    if len(files) > MAX_BATCH_FILES:
+        raise HTTPException(
+            status_code=413, detail=f"Max {MAX_BATCH_FILES} files per batch."
+        )
+
+    t_batch0 = time.perf_counter()
+    results: list[ComicSplitResult] = []
+
+    for file in files:
+        if not file.content_type or not file.content_type.startswith("image/"):
+            results.append(ComicSplitResult(
+                filename=file.filename or "unknown",
+                status="error",
+                error="File must be an image.",
+            ))
+            continue
+
+        image_bytes = await file.read()
+        if len(image_bytes) > MAX_UPLOAD_BYTES:
+            results.append(ComicSplitResult(
+                filename=file.filename or "unknown",
+                status="error",
+                error="Image must be under 30 MB.",
+            ))
+            continue
+
+        t0 = time.perf_counter()
+        try:
+            result: SplitResult = split_panels(
+                image_bytes=image_bytes,
+                binary_threshold=binary_threshold,
+                white_threshold=white_threshold,
+                min_panel_ratio=min_panel_ratio,
+                detect_divider_lines=detect_divider_lines,
+                dark_threshold=dark_threshold,
+                line_std_threshold=line_std_threshold,
+            )
+        except Exception as exc:
+            logger.exception("Splitter failed on %s: %s", file.filename, exc)
+            results.append(ComicSplitResult(
+                filename=file.filename or "unknown",
+                status="error",
+                error=f"Processing error: {exc}",
+            ))
+            continue
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+
+        if not result.panels:
+            results.append(ComicSplitResult(
+                filename=file.filename or "unknown",
+                status="error",
+                error="No panels detected.",
+            ))
+            continue
+
+        results.append(ComicSplitResult(
+            filename=file.filename or "unknown",
+            status="ok",
+            panels=result.panels,
+            rows=result.rows,
+            cols=result.cols,
+            grid=result.grid,
+            metadata=result.metadata,
+            processing_time_ms=round(elapsed_ms, 2),
+        ))
+
+    total_elapsed_ms = (time.perf_counter() - t_batch0) * 1000
+    logger.info(
+        "Batch split %d files in %.1f ms (%d ok, %d failed)",
+        len(files), total_elapsed_ms,
+        sum(1 for r in results if r.status == "ok"),
+        sum(1 for r in results if r.status == "error"),
+    )
+
+    return BatchSplitResponse(
+        results=results,
+        total_processing_time_ms=round(total_elapsed_ms, 2),
     )

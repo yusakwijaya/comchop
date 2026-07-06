@@ -3,23 +3,37 @@ import ComicUploader from './components/ComicUploader'
 import PanelGrid, { Panel } from './components/PanelGrid'
 
 // ── Types ────────────────────────────────────────────────────────────────────
-interface SplitResponse {
+interface ComicSplitResult {
+  filename: string
+  status: 'ok' | 'error'
   panels: string[]
   rows: number
   cols: number
   grid: [number, number][]
   metadata: Record<string, unknown>
   processing_time_ms: number
+  error: string | null
 }
 
-interface AppState {
-  status: 'idle' | 'processing' | 'done' | 'error'
+interface BatchSplitResponse {
+  results: ComicSplitResult[]
+  total_processing_time_ms: number
+}
+
+interface ComicGroup {
+  filename: string
+  status: 'ok' | 'error'
   panels: Panel[]
   rows: number
   cols: number
   processingMs: number
   error: string | null
-  originalName: string | null
+}
+
+interface AppState {
+  status: 'idle' | 'processing' | 'done' | 'error'
+  comics: ComicGroup[]
+  error: string | null
 }
 
 // ── Settings defaults ─────────────────────────────────────────────────────────
@@ -30,12 +44,8 @@ const DEFAULT_MIN_PANEL = 0.15
 export default function App() {
   const [state, setState] = useState<AppState>({
     status: 'idle',
-    panels: [],
-    rows: 0,
-    cols: 0,
-    processingMs: 0,
+    comics: [],
     error: null,
-    originalName: null,
   })
 
   // Advanced settings
@@ -44,39 +54,39 @@ export default function App() {
   const [minPanel, setMinPanel] = useState(DEFAULT_MIN_PANEL)
   const [showSettings, setShowSettings] = useState(false)
 
-  const handleUpload = useCallback(async (file: File) => {
-    setState(s => ({ ...s, status: 'processing', error: null, originalName: file.name }))
+  const handleUpload = useCallback(async (files: File[]) => {
+    setState(s => ({ ...s, status: 'processing', error: null }))
 
     const form = new FormData()
-    form.append('file', file)
+    files.forEach(f => form.append('files', f))
     form.append('binary_threshold', String(binaryThreshold))
     form.append('white_threshold', String(whiteThreshold))
     form.append('min_panel_ratio', String(minPanel))
 
     try {
-      const res = await fetch('/api/split', { method: 'POST', body: form })
+      const res = await fetch('/api/split-batch', { method: 'POST', body: form })
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: res.statusText }))
         throw new Error(err.detail ?? 'Server error')
       }
-      const data: SplitResponse = await res.json()
+      const data: BatchSplitResponse = await res.json()
 
-      const panels: Panel[] = data.panels.map((b64, i) => ({
-        b64,
-        row: data.grid[i][0],
-        col: data.grid[i][1],
-        index: i,
+      const comics: ComicGroup[] = data.results.map(r => ({
+        filename: r.filename,
+        status: r.status,
+        error: r.error,
+        rows: r.rows,
+        cols: r.cols,
+        processingMs: r.processing_time_ms,
+        panels: r.panels.map((b64, i) => ({
+          b64,
+          row: r.grid[i][0],
+          col: r.grid[i][1],
+          index: i,
+        })),
       }))
 
-      setState({
-        status: 'done',
-        panels,
-        rows: data.rows,
-        cols: data.cols,
-        processingMs: data.processing_time_ms,
-        error: null,
-        originalName: file.name,
-      })
+      setState({ status: 'done', comics, error: null })
     } catch (err) {
       setState(s => ({
         ...s,
@@ -86,8 +96,7 @@ export default function App() {
     }
   }, [binaryThreshold, whiteThreshold, minPanel])
 
-  const reset = () =>
-    setState({ status: 'idle', panels: [], rows: 0, cols: 0, processingMs: 0, error: null, originalName: null })
+  const reset = () => setState({ status: 'idle', comics: [], error: null })
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -221,15 +230,34 @@ export default function App() {
           </div>
         )}
 
-        {/* Results */}
+        {/* Results — one section per uploaded comic, kept separate */}
         {state.status === 'done' && (
-          <PanelGrid
-            panels={state.panels}
-            rows={state.rows}
-            cols={state.cols}
-            processingMs={state.processingMs}
-            originalName={state.originalName ?? 'panel'}
-          />
+          <div className="flex flex-col gap-12">
+            {state.comics.map((comic, i) => (
+              <div key={`${comic.filename}-${i}`} id={`comic-group-${i}`}>
+                <h3 className="text-sm font-semibold text-surface-200/70 mb-3 truncate">
+                  {comic.filename}
+                </h3>
+                {comic.status === 'ok' ? (
+                  <PanelGrid
+                    panels={comic.panels}
+                    rows={comic.rows}
+                    cols={comic.cols}
+                    processingMs={comic.processingMs}
+                    originalName={comic.filename}
+                  />
+                ) : (
+                  <div className="glass rounded-2xl border border-red-800/50 bg-red-900/10 p-5 flex items-start gap-3">
+                    <AlertIcon />
+                    <div>
+                      <p className="font-semibold text-red-400 text-sm">Processing failed</p>
+                      <p className="text-surface-200/60 text-sm mt-0.5">{comic.error}</p>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
         )}
       </main>
 
