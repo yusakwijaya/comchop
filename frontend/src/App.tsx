@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useRef } from 'react'
 import ComicUploader from './components/ComicUploader'
 import PanelGrid, { Panel } from './components/PanelGrid'
 
@@ -37,8 +37,8 @@ interface AppState {
 }
 
 // ── Settings defaults ─────────────────────────────────────────────────────────
-const DEFAULT_BINARY_THRESHOLD = 240
-const DEFAULT_WHITE_THRESHOLD = 0.99
+const DEFAULT_WHITE_MEDIAN_THRESHOLD = 200
+const DEFAULT_GUTTER_STD_THRESHOLD = 30
 const DEFAULT_MIN_PANEL = 0.15
 
 export default function App() {
@@ -49,18 +49,23 @@ export default function App() {
   })
 
   // Advanced settings
-  const [binaryThreshold, setBinaryThreshold] = useState(DEFAULT_BINARY_THRESHOLD)
-  const [whiteThreshold, setWhiteThreshold] = useState(DEFAULT_WHITE_THRESHOLD)
+  const [whiteMedianThreshold, setWhiteMedianThreshold] = useState(DEFAULT_WHITE_MEDIAN_THRESHOLD)
+  const [gutterStdThreshold, setGutterStdThreshold] = useState(DEFAULT_GUTTER_STD_THRESHOLD)
   const [minPanel, setMinPanel] = useState(DEFAULT_MIN_PANEL)
   const [showSettings, setShowSettings] = useState(false)
 
+  // Keep the last uploaded files around so "re-run" can resend them with
+  // new parameter values without requiring the user to re-upload.
+  const lastFilesRef = useRef<File[]>([])
+
   const handleUpload = useCallback(async (files: File[]) => {
+    lastFilesRef.current = files
     setState(s => ({ ...s, status: 'processing', error: null }))
 
     const form = new FormData()
     files.forEach(f => form.append('files', f))
-    form.append('binary_threshold', String(binaryThreshold))
-    form.append('white_threshold', String(whiteThreshold))
+    form.append('white_median_threshold', String(whiteMedianThreshold))
+    form.append('gutter_std_threshold', String(gutterStdThreshold))
     form.append('min_panel_ratio', String(minPanel))
 
     try {
@@ -94,7 +99,11 @@ export default function App() {
         error: err instanceof Error ? err.message : 'Unknown error',
       }))
     }
-  }, [binaryThreshold, whiteThreshold, minPanel])
+  }, [whiteMedianThreshold, gutterStdThreshold, minPanel])
+
+  const rerun = useCallback(() => {
+    if (lastFilesRef.current.length > 0) handleUpload(lastFilesRef.current)
+  }, [handleUpload])
 
   const reset = () => setState({ status: 'idle', comics: [], error: null })
 
@@ -169,50 +178,16 @@ export default function App() {
               onUpload={handleUpload}
               isProcessing={state.status === 'processing'}
             />
-
-            {/* Advanced settings toggle */}
-            <div className="mt-4 text-center">
-              <button
-                id="toggle-settings-btn"
-                onClick={() => setShowSettings(s => !s)}
-                className="text-xs text-surface-200/40 hover:text-surface-200/70 transition-colors duration-150 inline-flex items-center gap-1"
-              >
-                <ChevronIcon open={showSettings} />
-                Advanced settings
-              </button>
-            </div>
-
-            {showSettings && (
-              <div className="mt-4 glass rounded-2xl border border-surface-500/30 p-5 grid sm:grid-cols-3 gap-5 animate-fade-in">
-                <SliderField
-                  id="binary-threshold-slider"
-                  label="Binary Threshold"
-                  hint="Pixel brightness cut-off — pixels above this become 'white' (200–255)"
-                  min={200} max={255} step={1}
-                  value={binaryThreshold}
-                  onChange={setBinaryThreshold}
-                  format={(v) => String(v)}
-                />
-                <SliderField
-                  id="white-threshold-slider"
-                  label="White Threshold"
-                  hint="Min fraction of white pixels for a row/col to be a gutter"
-                  min={0.8} max={1.0} step={0.005}
-                  value={whiteThreshold}
-                  onChange={setWhiteThreshold}
-                  format={(v) => (v * 100).toFixed(1) + '%'}
-                />
-                <SliderField
-                  id="min-panel-slider"
-                  label="Min Panel Size"
-                  hint="Strips smaller than this fraction of the image are discarded"
-                  min={0.05} max={0.45} step={0.01}
-                  value={minPanel}
-                  onChange={setMinPanel}
-                  format={(v) => (v * 100).toFixed(0) + '%'}
-                />
-              </div>
-            )}
+            <SettingsPanel
+              show={showSettings}
+              onToggle={() => setShowSettings(s => !s)}
+              whiteMedianThreshold={whiteMedianThreshold}
+              setWhiteMedianThreshold={setWhiteMedianThreshold}
+              gutterStdThreshold={gutterStdThreshold}
+              setGutterStdThreshold={setGutterStdThreshold}
+              minPanel={minPanel}
+              setMinPanel={setMinPanel}
+            />
           </div>
         )}
 
@@ -233,6 +208,66 @@ export default function App() {
         {/* Results — one section per uploaded comic, kept separate */}
         {state.status === 'done' && (
           <div className="flex flex-col gap-12">
+            {/* Not happy with a result? Tweak the settings and re-run without re-uploading */}
+            <div className="glass rounded-2xl border border-surface-500/30 p-5 animate-fade-in">
+              <div className="flex items-center justify-between gap-4">
+                <button
+                  id="toggle-settings-btn"
+                  onClick={() => setShowSettings(s => !s)}
+                  className="text-xs text-surface-200/40 hover:text-surface-200/70 transition-colors duration-150 inline-flex items-center gap-1"
+                >
+                  <ChevronIcon open={showSettings} />
+                  Not quite right? Adjust settings and re-run
+                </button>
+                <button
+                  id="rerun-btn"
+                  onClick={rerun}
+                  disabled={state.status !== 'done'}
+                  className="
+                    flex items-center gap-2 rounded-lg px-4 py-1.5
+                    bg-brand-600 hover:bg-brand-500
+                    text-white text-xs font-semibold
+                    transition-colors duration-200 flex-shrink-0
+                  "
+                >
+                  <RefreshIcon />
+                  Re-run
+                </button>
+              </div>
+
+              {showSettings && (
+                <div className="mt-4 grid sm:grid-cols-3 gap-5 animate-fade-in">
+                  <SliderField
+                    id="white-median-threshold-slider-rerun"
+                    label="White Median Threshold"
+                    hint="Median brightness a row/col must exceed to count as a white gutter"
+                    min={100} max={255} step={1}
+                    value={whiteMedianThreshold}
+                    onChange={setWhiteMedianThreshold}
+                    format={(v) => String(v)}
+                  />
+                  <SliderField
+                    id="gutter-std-threshold-slider-rerun"
+                    label="Gutter Flatness"
+                    hint="Max variation allowed for a row/col to still count as a flat, uniform gutter"
+                    min={0} max={100} step={1}
+                    value={gutterStdThreshold}
+                    onChange={setGutterStdThreshold}
+                    format={(v) => String(v)}
+                  />
+                  <SliderField
+                    id="min-panel-slider-rerun"
+                    label="Min Panel Size"
+                    hint="Strips smaller than this fraction of the image are discarded"
+                    min={0.05} max={0.45} step={0.01}
+                    value={minPanel}
+                    onChange={setMinPanel}
+                    format={(v) => (v * 100).toFixed(0) + '%'}
+                  />
+                </div>
+              )}
+            </div>
+
             {state.comics.map((comic, i) => (
               <div key={`${comic.filename}-${i}`} id={`comic-group-${i}`}>
                 <h3 className="text-sm font-semibold text-surface-200/70 mb-3 truncate">
@@ -272,6 +307,71 @@ export default function App() {
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
+interface SettingsPanelProps {
+  show: boolean
+  onToggle: () => void
+  whiteMedianThreshold: number
+  setWhiteMedianThreshold: (v: number) => void
+  gutterStdThreshold: number
+  setGutterStdThreshold: (v: number) => void
+  minPanel: number
+  setMinPanel: (v: number) => void
+}
+
+function SettingsPanel({
+  show, onToggle,
+  whiteMedianThreshold, setWhiteMedianThreshold,
+  gutterStdThreshold, setGutterStdThreshold,
+  minPanel, setMinPanel,
+}: SettingsPanelProps) {
+  return (
+    <>
+      <div className="mt-4 text-center">
+        <button
+          id="toggle-settings-btn"
+          onClick={onToggle}
+          className="text-xs text-surface-200/40 hover:text-surface-200/70 transition-colors duration-150 inline-flex items-center gap-1"
+        >
+          <ChevronIcon open={show} />
+          Advanced settings
+        </button>
+      </div>
+
+      {show && (
+        <div className="mt-4 glass rounded-2xl border border-surface-500/30 p-5 grid sm:grid-cols-3 gap-5 animate-fade-in">
+          <SliderField
+            id="white-median-threshold-slider"
+            label="White Median Threshold"
+            hint="Median brightness a row/col must exceed to count as a white gutter"
+            min={100} max={255} step={1}
+            value={whiteMedianThreshold}
+            onChange={setWhiteMedianThreshold}
+            format={(v) => String(v)}
+          />
+          <SliderField
+            id="gutter-std-threshold-slider"
+            label="Gutter Flatness"
+            hint="Max variation allowed for a row/col to still count as a flat, uniform gutter"
+            min={0} max={100} step={1}
+            value={gutterStdThreshold}
+            onChange={setGutterStdThreshold}
+            format={(v) => String(v)}
+          />
+          <SliderField
+            id="min-panel-slider"
+            label="Min Panel Size"
+            hint="Strips smaller than this fraction of the image are discarded"
+            min={0.05} max={0.45} step={0.01}
+            value={minPanel}
+            onChange={setMinPanel}
+            format={(v) => (v * 100).toFixed(0) + '%'}
+          />
+        </div>
+      )}
+    </>
+  )
+}
+
 interface SliderFieldProps {
   id: string
   label: string

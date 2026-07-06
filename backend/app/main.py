@@ -85,10 +85,10 @@ async def health_check() -> HealthResponse:
 @app.post("/api/split", response_model=SplitResponse, tags=["Splitter"])
 async def split_comic(
     file: UploadFile = File(..., description="Comic image (PNG / JPG / WebP)"),
-    binary_threshold: int = Form(240, ge=200, le=255,
-        description="Pixel brightness cut-off for binarisation (200–255)"),
-    white_threshold: float = Form(0.99, ge=0.8, le=1.0,
-        description="Min fraction of white pixels for a row/col to be a gutter (0.8–1.0)"),
+    white_median_threshold: int = Form(200, ge=100, le=255,
+        description="Median brightness a row/col must exceed to count as a white gutter"),
+    gutter_std_threshold: float = Form(30.0, ge=0.0, le=100.0,
+        description="Max std-dev for a row/col to count as a flat, uniform white gutter"),
     min_panel_ratio: float = Form(0.15, ge=0.05, le=0.5,
         description="Min panel size as fraction of image dimension (0.05–0.5)"),
     detect_divider_lines: bool = Form(True,
@@ -114,8 +114,8 @@ async def split_comic(
     try:
         result: SplitResult = split_panels(
             image_bytes=image_bytes,
-            binary_threshold=binary_threshold,
-            white_threshold=white_threshold,
+            white_median_threshold=white_median_threshold,
+            gutter_std_threshold=gutter_std_threshold,
             min_panel_ratio=min_panel_ratio,
             detect_divider_lines=detect_divider_lines,
             dark_threshold=dark_threshold,
@@ -131,8 +131,8 @@ async def split_comic(
         raise HTTPException(
             status_code=422,
             detail=(
-                "No panels detected. Try lowering the binary threshold or "
-                "the white threshold, or reduce the min panel ratio."
+                "No panels detected. Try lowering the white median threshold, "
+                "raising the gutter std threshold, or reducing the min panel ratio."
             ),
         )
 
@@ -154,8 +154,8 @@ async def split_comic(
 @app.post("/api/split-batch", response_model=BatchSplitResponse, tags=["Splitter"])
 async def split_comics_batch(
     files: list[UploadFile] = File(..., description="Multiple comic images (PNG / JPG / WebP)"),
-    binary_threshold: int = Form(240, ge=200, le=255),
-    white_threshold: float = Form(0.99, ge=0.8, le=1.0),
+    white_median_threshold: int = Form(200, ge=100, le=255),
+    gutter_std_threshold: float = Form(30.0, ge=0.0, le=100.0),
     min_panel_ratio: float = Form(0.15, ge=0.05, le=0.5),
     detect_divider_lines: bool = Form(True),
     dark_threshold: int = Form(70, ge=0, le=150),
@@ -195,8 +195,8 @@ async def split_comics_batch(
         try:
             result: SplitResult = split_panels(
                 image_bytes=image_bytes,
-                binary_threshold=binary_threshold,
-                white_threshold=white_threshold,
+                white_median_threshold=white_median_threshold,
+                gutter_std_threshold=gutter_std_threshold,
                 min_panel_ratio=min_panel_ratio,
                 detect_divider_lines=detect_divider_lines,
                 dark_threshold=dark_threshold,
