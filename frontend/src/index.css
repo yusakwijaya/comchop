@@ -1,0 +1,105 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Global resets ─────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: 'Inter', system-ui, sans-serif;
+  background-color: #0d0e14;
+  color: #e2e4f0;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Noise overlay ─────────────────────────────────────────────────── */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.04'/%3E%3C/svg%3E");
+  opacity: 0.35;
+}
+
+#root { position: relative; z-index: 1; }
+
+/* ── Scrollbar ─────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #13141e; }
+::-webkit-scrollbar-thumb { background: #3740d4; border-radius: 99px; }
+
+/* ── Glassmorphism card ────────────────────────────────────────────── */
+.glass {
+  background: rgba(26, 28, 42, 0.7);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+/* ── Gradient text ─────────────────────────────────────────────────── */
+.gradient-text {
+  background: linear-gradient(135deg, #7d96fa 0%, #fb923c 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ── Shimmer skeleton ──────────────────────────────────────────────── */
+.shimmer-bg {
+  background: linear-gradient(
+    90deg,
+    rgba(42,45,67,0.6) 25%,
+    rgba(90,111,245,0.15) 50%,
+    rgba(42,45,67,0.6) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.8s infinite;
+}
+
+/* ── Glow button ───────────────────────────────────────────────────── */
+.btn-glow {
+  position: relative;
+  overflow: hidden;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+.btn-glow::after {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  background: linear-gradient(135deg, #5a6ff5, #fb923c);
+  z-index: -1;
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.btn-glow:hover { transform: translateY(-1px); box-shadow: 0 8px 32px rgba(90,111,245,0.35); }
+.btn-glow:hover::after { opacity: 1; }
+.btn-glow:active { transform: translateY(0); }
+
+/* ── Drop zone pulse border ────────────────────────────────────────── */
+@keyframes borderPulse {
+  0%, 100% { border-color: rgba(90,111,245,0.4); }
+  50%       { border-color: rgba(90,111,245,0.9); }
+}
+.drop-active {
+  animation: borderPulse 1s ease-in-out infinite;
+  background: rgba(90,111,245,0.08) !important;
+}
+
+/* ── Panel card hover lift ─────────────────────────────────────────── */
+.panel-card {
+  transition: transform 0.25s cubic-bezier(.34,1.56,.64,1),
+              box-shadow 0.25s ease,
+              border-color 0.25s ease;
+}
+.panel-card:hover {
+  transform: translateY(-4px) scale(1.015);
+  box-shadow: 0 16px 48px rgba(90,111,245,0.25);
+  border-color: rgba(90,111,245,0.5);
+}
