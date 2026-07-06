@@ -4,34 +4,41 @@ ComChop – Comic Panel Splitter (Gutter-projection algorithm)
 Algorithm
 ---------
 1. Decode image and convert to grayscale.
-2. Apply a simple global binary threshold (pixel > 240 → white).
-   This is intentionally strict: only genuine white gutters pass.
-3. Compute per-row and per-column mean brightness across the thresholded
-   image.  A row/col whose mean exceeds `white_threshold` (default 99% of
-   255) is tagged as a gutter candidate.
-4. In addition to white gutters, rows/cols are also tagged as gutter
+2. Compute per-row and per-column *median* brightness plus standard
+   deviation. A row/col is a white-gutter candidate when its median exceeds
+   `white_median_threshold` AND its standard deviation is below
+   `gutter_std_threshold`.
+   Median (rather than mean) is what makes this reliable for thin,
+   anti-aliased or JPEG-compressed gutters: a couple of stray dark/blurred
+   pixels can pull a strict mean-based test below threshold even though the
+   row is overwhelmingly a clean gutter. The std check is what keeps this
+   from false-positiving on a row that happens to pass through a bright
+   speech bubble — that row has a high median too, but a high standard
+   deviation (bubble + surrounding dark art), whereas a genuine gutter row
+   is both bright *and* flat.
+3. In addition to white gutters, rows/cols are also tagged as gutter
    candidates when they are a thin, uniform *divider line* (typically
    black) rather than whitespace — this covers comics whose panels touch
    directly and are separated only by a border line instead of a gap.
    A row/col qualifies when its mean brightness is below `dark_threshold`
    and its standard deviation is below `line_std_threshold` (i.e. it's a
    flat, solid line rather than dark artwork/textured content).
-5. Consecutive gutter-candidate indices (white OR line) are grouped into
+4. Consecutive gutter-candidate indices (white OR line) are grouped into
    bands. The *median* index of each band becomes a cut coordinate — this
    is more robust than taking the midpoint of the outermost pixels.
-6. The image edges (0, height / 0, width) are inserted as cut coordinates
+5. The image edges (0, height / 0, width) are inserted as cut coordinates
    only when the nearest detected gutter is more than `edge_margin` pixels
    away, preventing thin marginal slices.
-7. Row bands are detected first (step 3–6, scanning the *full width* of the
-   image). Column cuts are then computed independently *within each row
+6. Row bands are detected first (steps 2–5, scanning the *full width* of
+   the image). Column cuts are then computed independently *within each row
    band* rather than across the whole image — this supports irregular
    grids where different rows have a different number of panels (e.g. a
    2-2-1 layout where the bottom row is one wide panel with no vertical
    divider).
-8. Panels are the rectangular regions between adjacent cut coordinates.
+7. Panels are the rectangular regions between adjacent cut coordinates.
    Regions narrower than `min_panel_ratio` of the total dimension (default
    15 %) are discarded as margins or artifact lines.
-9. Surviving panels are JPEG-encoded and returned as base-64 strings.
+8. Surviving panels are JPEG-encoded and returned as base-64 strings.
 """
 
 from __future__ import annotations
@@ -78,58 +85,92 @@ def _cv_to_base64_jpg(cv_img: np.ndarray, quality: int = 92) -> str:
     return base64.b64encode(buf.tobytes()).decode("utf-8")
 
 
+def _band_centers(
+    indices: np.ndarray,
+    max_val: int,
+    max_gutter_ratio: float,
+) -> List[int]:
+    """
+    Group consecutive indices into contiguous bands and return the median
+    index of each band that survives — bands are always split by proximity
+    (a run of dark-line candidates never merges with a run of white-gutter
+    candidates as they are grouped separately by the caller), and any band
+    thicker than `max_gutter_ratio` of `max_val` is discarded rather than
+    turned into a cut. The thickness cap is what distinguishes a genuine,
+    thin divider (a few px of whitespace or a border line) from a large
+    panel that simply has a bright/uniform-colored background spanning most
+    of its width or height — without it, a wide expanse of flat cream or
+    pastel background would itself look like one giant "gutter".
+    """
+    if len(indices) == 0:
+        return []
+
+    diff = np.diff(indices)
+    split_points = np.where(diff > 1)[0] + 1
+    groups = np.split(indices, split_points)
+
+    max_thickness = max_val * max_gutter_ratio
+    groups = [g for g in groups if len(g) <= max_thickness]
+
+    return [int(np.median(g)) for g in groups]
+
+
 def _gutter_line_indices(
     mat: np.ndarray,
-    binary_threshold: int,
-    white_threshold: float,
+    white_median_threshold: int,
+    gutter_std_threshold: float,
     detect_divider_lines: bool,
     dark_threshold: int,
     line_std_threshold: float,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Given a 2-D grayscale matrix, return the indices along axis 0 that are
-    gutter candidates — either near-white rows or thin, uniform dark divider
-    lines. Each index is evaluated using stats computed across axis 1, so to
-    detect column gutters pass in the transposed matrix.
+    Given a 2-D grayscale matrix, return two index arrays along axis 0:
+    near-white gutter candidates, and thin uniform dark divider-line
+    candidates. Each index is evaluated using stats computed across axis 1,
+    so to detect column gutters pass in the transposed matrix. Kept separate
+    (rather than unioned) so a thin dark line sitting inside a much larger
+    bright background doesn't get merged into one thick band and discarded.
     """
-    _, thresh = cv2.threshold(mat, binary_threshold, 255, cv2.THRESH_BINARY)
-    means = np.mean(thresh, axis=1)
-    gutter_level = 255 * white_threshold
-    white_idx = np.where(means > gutter_level)[0]
+    medians = np.median(mat, axis=1)
+    stds = np.std(mat, axis=1)
+
+    white_idx = np.where(
+        (medians > white_median_threshold) & (stds < gutter_std_threshold)
+    )[0]
 
     line_idx = np.array([], dtype=int)
     if detect_divider_lines:
-        raw_means = np.mean(mat, axis=1)
-        raw_std = np.std(mat, axis=1)
+        means = np.mean(mat, axis=1)
         line_idx = np.where(
-            (raw_means < dark_threshold) & (raw_std < line_std_threshold)
+            (means < dark_threshold) & (stds < line_std_threshold)
         )[0]
 
-    return np.union1d(white_idx, line_idx)
+    return white_idx, line_idx
 
 
 def _find_segments(
-    gutter_indices: np.ndarray,
+    white_idx: np.ndarray,
+    line_idx: np.ndarray,
     max_val: int,
     edge_margin: int,
+    white_max_gutter_ratio: float = 0.05,
+    line_max_gutter_ratio: float = 0.02,
 ) -> List[int]:
     """
-    Group consecutive gutter indices into bands and return a sorted list of
-    cut coordinates (the median of each band).
+    Convert white-gutter and divider-line candidate indices into a sorted
+    list of cut coordinates. The two candidate types are grouped and
+    thickness-capped independently, then combined.
 
     Image edges (0 and max_val) are appended only when the nearest detected
     gutter is further than `edge_margin` pixels away.
     """
-    if len(gutter_indices) == 0:
+    centers = sorted(set(
+        _band_centers(white_idx, max_val, white_max_gutter_ratio) +
+        _band_centers(line_idx, max_val, line_max_gutter_ratio)
+    ))
+
+    if not centers:
         return [0, max_val]
-
-    # Split consecutive run into separate groups
-    diff = np.diff(gutter_indices)
-    split_points = np.where(diff > 1)[0] + 1
-    groups = np.split(gutter_indices, split_points)
-
-    # Take the median index of each group as the cut coordinate
-    centers: List[int] = [int(np.median(g)) for g in groups]
 
     # Prepend 0 only if the first gutter is far enough from the top edge
     if centers[0] > edge_margin:
@@ -148,8 +189,8 @@ def _find_segments(
 
 def split_panels(
     image_bytes: bytes,
-    binary_threshold: int = 240,
-    white_threshold: float = 0.99,
+    white_median_threshold: int = 200,
+    gutter_std_threshold: float = 30.0,
     min_panel_ratio: float = 0.15,
     edge_margin: int = 15,
     jpeg_quality: int = 92,
@@ -163,11 +204,12 @@ def split_panels(
     Parameters
     ----------
     image_bytes       : Raw image file bytes (any Pillow-supported format).
-    binary_threshold  : Pixel brightness cut-off for the initial binarisation
-                        (0–255).  Pixels above this value become white (255).
-    white_threshold   : Fraction of 255 that a row/col mean must exceed to be
-                        considered a gutter (0–1).  Default 0.99 ≈ almost
-                        entirely white.
+    white_median_threshold : Median brightness (0–255) a row/col must exceed
+                        to be considered a white gutter candidate.
+    gutter_std_threshold : Max standard deviation a row/col may have and
+                        still count as a flat, uniform white gutter (as
+                        opposed to a bright but busy region like a speech
+                        bubble sitting inside otherwise dark artwork).
     min_panel_ratio   : Minimum panel size as a fraction of the total image
                         dimension.  Slices below this are discarded as borders
                         or watermark strips.
@@ -190,17 +232,20 @@ def split_panels(
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
 
-    def gutters(mat: np.ndarray) -> np.ndarray:
+    def gutters(mat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         return _gutter_line_indices(
-            mat, binary_threshold, white_threshold,
+            mat, white_median_threshold, gutter_std_threshold,
             detect_divider_lines, dark_threshold, line_std_threshold,
         )
 
     # ── Row bands: detected once, scanning the full width ────────────────
-    gutter_rows = gutters(gray)
-    y_cuts = _find_segments(gutter_rows, h, edge_margin)
+    white_rows, line_rows = gutters(gray)
+    y_cuts = _find_segments(white_rows, line_rows, h, edge_margin)
 
-    logger.debug("Gutter rows: %d candidates  |  Y cuts: %s", len(gutter_rows), y_cuts)
+    logger.debug(
+        "Gutter rows: %d white, %d line  |  Y cuts: %s",
+        len(white_rows), len(line_rows), y_cuts,
+    )
 
     # ── Crop and encode panels ─────────────────────────────────────────────
     result = SplitResult()
@@ -217,8 +262,8 @@ def split_panels(
         # (supports irregular grids, e.g. a wide bottom row with no
         # vertical divider even though rows above it do have one)
         band_gray = gray[y1:y2, :]
-        gutter_cols = gutters(band_gray.T)
-        x_cuts = _find_segments(gutter_cols, w, edge_margin)
+        white_cols, line_cols = gutters(band_gray.T)
+        x_cuts = _find_segments(white_cols, line_cols, w, edge_margin)
         x_cuts_by_row.append(x_cuts)
 
         for ci in range(len(x_cuts) - 1):
@@ -244,7 +289,7 @@ def split_panels(
         "original_size": [w, h],
         "y_cuts": y_cuts,
         "x_cuts_by_row": x_cuts_by_row,
-        "gutter_row_count": int(len(gutter_rows)),
+        "gutter_row_count": int(len(white_rows) + len(line_rows)),
     }
 
     return result
