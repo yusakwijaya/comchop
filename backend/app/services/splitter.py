@@ -22,10 +22,16 @@ Algorithm
 6. The image edges (0, height / 0, width) are inserted as cut coordinates
    only when the nearest detected gutter is more than `edge_margin` pixels
    away, preventing thin marginal slices.
-7. Panels are the rectangular regions between adjacent cut coordinates.
+7. Row bands are detected first (step 3–6, scanning the *full width* of the
+   image). Column cuts are then computed independently *within each row
+   band* rather than across the whole image — this supports irregular
+   grids where different rows have a different number of panels (e.g. a
+   2-2-1 layout where the bottom row is one wide panel with no vertical
+   divider).
+8. Panels are the rectangular regions between adjacent cut coordinates.
    Regions narrower than `min_panel_ratio` of the total dimension (default
    15 %) are discarded as margins or artifact lines.
-8. Surviving panels are JPEG-encoded and returned as base-64 strings.
+9. Surviving panels are JPEG-encoded and returned as base-64 strings.
 """
 
 from __future__ import annotations
@@ -70,6 +76,36 @@ def _cv_to_base64_jpg(cv_img: np.ndarray, quality: int = 92) -> str:
     if not success:
         raise RuntimeError("Failed to encode panel to JPEG")
     return base64.b64encode(buf.tobytes()).decode("utf-8")
+
+
+def _gutter_line_indices(
+    mat: np.ndarray,
+    binary_threshold: int,
+    white_threshold: float,
+    detect_divider_lines: bool,
+    dark_threshold: int,
+    line_std_threshold: float,
+) -> np.ndarray:
+    """
+    Given a 2-D grayscale matrix, return the indices along axis 0 that are
+    gutter candidates — either near-white rows or thin, uniform dark divider
+    lines. Each index is evaluated using stats computed across axis 1, so to
+    detect column gutters pass in the transposed matrix.
+    """
+    _, thresh = cv2.threshold(mat, binary_threshold, 255, cv2.THRESH_BINARY)
+    means = np.mean(thresh, axis=1)
+    gutter_level = 255 * white_threshold
+    white_idx = np.where(means > gutter_level)[0]
+
+    line_idx = np.array([], dtype=int)
+    if detect_divider_lines:
+        raw_means = np.mean(mat, axis=1)
+        raw_std = np.std(mat, axis=1)
+        line_idx = np.where(
+            (raw_means < dark_threshold) & (raw_std < line_std_threshold)
+        )[0]
+
+    return np.union1d(white_idx, line_idx)
 
 
 def _find_segments(
@@ -154,63 +190,41 @@ def split_panels(
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
 
-    # ── Global threshold → per-row / per-col means ────────────────────────
-    _, thresh = cv2.threshold(gray, binary_threshold, 255, cv2.THRESH_BINARY)
+    def gutters(mat: np.ndarray) -> np.ndarray:
+        return _gutter_line_indices(
+            mat, binary_threshold, white_threshold,
+            detect_divider_lines, dark_threshold, line_std_threshold,
+        )
 
-    row_means = np.mean(thresh, axis=1)   # shape (h,)
-    col_means = np.mean(thresh, axis=0)   # shape (w,)
-
-    gutter_level = 255 * white_threshold
-
-    white_rows = np.where(row_means > gutter_level)[0]
-    white_cols = np.where(col_means > gutter_level)[0]
-
-    # ── Uniform divider-line detection (panels with no gap, just a rule) ──
-    line_rows = np.array([], dtype=int)
-    line_cols = np.array([], dtype=int)
-    if detect_divider_lines:
-        raw_row_means = np.mean(gray, axis=1)
-        raw_col_means = np.mean(gray, axis=0)
-        raw_row_std = np.std(gray, axis=1)
-        raw_col_std = np.std(gray, axis=0)
-
-        line_rows = np.where(
-            (raw_row_means < dark_threshold) & (raw_row_std < line_std_threshold)
-        )[0]
-        line_cols = np.where(
-            (raw_col_means < dark_threshold) & (raw_col_std < line_std_threshold)
-        )[0]
-
-    gutter_rows = np.union1d(white_rows, line_rows)
-    gutter_cols = np.union1d(white_cols, line_cols)
-
-    logger.debug(
-        "Gutter rows: %d candidates (white=%d, line=%d)  |  "
-        "Gutter cols: %d candidates (white=%d, line=%d)",
-        len(gutter_rows), len(white_rows), len(line_rows),
-        len(gutter_cols), len(white_cols), len(line_cols),
-    )
-
-    # ── Convert gutter bands to cut coordinates ───────────────────────────
+    # ── Row bands: detected once, scanning the full width ────────────────
+    gutter_rows = gutters(gray)
     y_cuts = _find_segments(gutter_rows, h, edge_margin)
-    x_cuts = _find_segments(gutter_cols, w, edge_margin)
 
-    logger.debug("Y cuts: %s  |  X cuts: %s", y_cuts, x_cuts)
+    logger.debug("Gutter rows: %d candidates  |  Y cuts: %s", len(gutter_rows), y_cuts)
 
     # ── Crop and encode panels ─────────────────────────────────────────────
-    result = SplitResult(
-        rows=len(y_cuts) - 1,
-        cols=len(x_cuts) - 1,
-    )
+    result = SplitResult()
+    x_cuts_by_row: List[List[int]] = []
 
     for ri in range(len(y_cuts) - 1):
+        y1, y2 = y_cuts[ri], y_cuts[ri + 1]
+
+        if (y2 - y1) <= h * min_panel_ratio:
+            x_cuts_by_row.append([])
+            continue
+
+        # ── Column cuts computed independently within this row band ──────
+        # (supports irregular grids, e.g. a wide bottom row with no
+        # vertical divider even though rows above it do have one)
+        band_gray = gray[y1:y2, :]
+        gutter_cols = gutters(band_gray.T)
+        x_cuts = _find_segments(gutter_cols, w, edge_margin)
+        x_cuts_by_row.append(x_cuts)
+
         for ci in range(len(x_cuts) - 1):
-            y1, y2 = y_cuts[ri], y_cuts[ri + 1]
             x1, x2 = x_cuts[ci], x_cuts[ci + 1]
 
             # Discard narrow margin strips
-            if (y2 - y1) <= h * min_panel_ratio:
-                continue
             if (x2 - x1) <= w * min_panel_ratio:
                 continue
 
@@ -229,9 +243,8 @@ def split_panels(
     result.metadata = {
         "original_size": [w, h],
         "y_cuts": y_cuts,
-        "x_cuts": x_cuts,
+        "x_cuts_by_row": x_cuts_by_row,
         "gutter_row_count": int(len(gutter_rows)),
-        "gutter_col_count": int(len(gutter_cols)),
     }
 
     return result
