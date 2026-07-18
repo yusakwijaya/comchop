@@ -22,17 +22,18 @@ export type LayersState =
   | { status: 'done'; layers: LayerSet }
   | { status: 'error'; error: string }
 
-export type Point = [number, number]
+/** (x0, y0, x1, y1) in the original image's pixel coordinates. */
+export type Box = [number, number, number, number]
 
 // ── API helper ───────────────────────────────────────────────────────────────
 export async function decomposeImage(
   imageB64: string,
-  points?: Point[],
+  boxes?: Box[],
 ): Promise<LayerSet> {
   const res = await fetch('/api/decompose', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ image_b64: imageB64, points: points ?? null }),
+    body: JSON.stringify({ image_b64: imageB64, boxes: boxes ?? null }),
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }))
@@ -55,15 +56,17 @@ interface Props {
   idSuffix: string | number
   /** Original image (base64) — needed for the manual character picker. */
   imageB64: string
-  /** Re-run decomposition; `points` are pixel coords in the original image. */
-  onDecompose: (points?: Point[]) => void
+  /** Re-run decomposition; `boxes` are pixel rects in the original image. */
+  onDecompose: (boxes?: Box[]) => void
 }
 
 export default function LayerResults({
   state, baseName, idSuffix, imageB64, onDecompose,
 }: Props) {
   const [picking, setPicking] = useState(false)
-  const [points, setPoints] = useState<Point[]>([])
+  const [boxes, setBoxes] = useState<Box[]>([])
+  const [draft, setDraft] = useState<Box | null>(null)
+  const dragStart = useRef<{ x: number; y: number } | null>(null)
   const imgRef = useRef<HTMLImageElement>(null)
 
   const downloadLayer = useCallback((b64: string, name: string) => {
@@ -73,21 +76,51 @@ export default function LayerResults({
     link.click()
   }, [])
 
-  const addPoint = useCallback((e: React.MouseEvent<HTMLImageElement>) => {
+  const toImageCoords = useCallback((e: { clientX: number; clientY: number }) => {
     const img = imgRef.current
-    if (!img) return
+    if (!img) return { x: 0, y: 0 }
     const rect = img.getBoundingClientRect()
-    // Map click from displayed size to natural pixel coordinates.
     const x = Math.round((e.clientX - rect.left) / rect.width * img.naturalWidth)
     const y = Math.round((e.clientY - rect.top) / rect.height * img.naturalHeight)
-    setPoints(p => [...p, [x, y]])
+    return {
+      x: Math.max(0, Math.min(img.naturalWidth, x)),
+      y: Math.max(0, Math.min(img.naturalHeight, y)),
+    }
   }, [])
 
-  const applyPoints = useCallback(() => {
-    if (points.length === 0) return
+  const onDragStart = useCallback((e: React.MouseEvent<HTMLImageElement>) => {
+    const { x, y } = toImageCoords(e)
+    dragStart.current = { x, y }
+    setDraft([x, y, x, y])
+  }, [toImageCoords])
+
+  const onDragMove = useCallback((e: React.MouseEvent<HTMLImageElement>) => {
+    if (!dragStart.current) return
+    const { x, y } = toImageCoords(e)
+    setDraft([dragStart.current.x, dragStart.current.y, x, y])
+  }, [toImageCoords])
+
+  const onDragEnd = useCallback(() => {
+    if (!dragStart.current || !draft) { dragStart.current = null; return }
+    const [x0, y0, x1, y1] = draft
+    if (Math.abs(x1 - x0) >= 6 && Math.abs(y1 - y0) >= 6) {
+      setBoxes(bs => [...bs, [
+        Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1),
+      ]])
+    }
+    dragStart.current = null
+    setDraft(null)
+  }, [draft])
+
+  const removeBox = useCallback((i: number) => {
+    setBoxes(bs => bs.filter((_, j) => j !== i))
+  }, [])
+
+  const applyBoxes = useCallback(() => {
+    if (boxes.length === 0) return
     setPicking(false)
-    onDecompose(points)
-  }, [points, onDecompose])
+    onDecompose(boxes)
+  }, [boxes, onDecompose])
 
   if (!state) return null
 
@@ -102,55 +135,85 @@ export default function LayerResults({
 
   // ── Manual character picker ──────────────────────────────────────────
   if (picking) {
+    const img = imgRef.current
+    const toPct = (px: number, py: number) => ({
+      left: img ? (px / img.naturalWidth) * 100 : 0,
+      top: img ? (py / img.naturalHeight) * 100 : 0,
+    })
+    const boxStyle = ([x0, y0, x1, y1]: Box) => {
+      const a = toPct(x0, y0)
+      const b = toPct(x1, y1)
+      return {
+        left: `${Math.min(a.left, b.left)}%`,
+        top: `${Math.min(a.top, b.top)}%`,
+        width: `${Math.abs(b.left - a.left)}%`,
+        height: `${Math.abs(b.top - a.top)}%`,
+      }
+    }
+
     return (
       <div className="px-3 pb-3 flex flex-col gap-2" id={`picker-${idSuffix}`}>
         <div className="text-[10px] text-surface-200/50 uppercase tracking-widest">
-          Click each character once ({points.length} selected)
+          Drag a box around each character ({boxes.length} selected)
         </div>
-        <div className="relative rounded-lg overflow-hidden border border-accent-500/50 cursor-crosshair">
+        <div
+          className="relative rounded-lg overflow-hidden border border-accent-500/50 cursor-crosshair select-none"
+          onMouseLeave={onDragEnd}
+        >
           <img
             ref={imgRef}
             src={`data:image/png;base64,${imageB64}`}
             alt="Pick characters"
             className="w-full h-auto object-contain select-none"
-            onClick={addPoint}
+            onMouseDown={onDragStart}
+            onMouseMove={onDragMove}
+            onMouseUp={onDragEnd}
             draggable={false}
           />
-          {points.map(([x, y], i) => {
-            const img = imgRef.current
-            const left = img ? (x / img.naturalWidth) * 100 : 0
-            const top = img ? (y / img.naturalHeight) * 100 : 0
-            return (
-              <span
-                key={i}
-                className="absolute w-5 h-5 -ml-2.5 -mt-2.5 rounded-full bg-accent-500 border-2 border-white text-white text-[10px] font-bold flex items-center justify-center pointer-events-none shadow"
-                style={{ left: `${left}%`, top: `${top}%` }}
-              >
+          {boxes.map((box, i) => (
+            <div
+              key={i}
+              className="absolute border-2 border-accent-500 bg-accent-500/15 group"
+              style={boxStyle(box)}
+            >
+              <span className="absolute -top-2.5 -left-2.5 w-5 h-5 rounded-full bg-accent-500 border-2 border-white text-white text-[10px] font-bold flex items-center justify-center shadow">
                 {i + 1}
               </span>
-            )
-          })}
+              <button
+                onClick={(e) => { e.stopPropagation(); removeBox(i) }}
+                className="absolute -top-2.5 -right-2.5 w-5 h-5 rounded-full bg-surface-900 border-2 border-white text-white text-[10px] font-bold flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+          {draft && (
+            <div
+              className="absolute border-2 border-dashed border-accent-400 bg-accent-400/10 pointer-events-none"
+              style={boxStyle(draft)}
+            />
+          )}
         </div>
         <div className="flex gap-2">
           <button
             id={`picker-apply-${idSuffix}`}
-            onClick={applyPoints}
-            disabled={points.length === 0}
+            onClick={applyBoxes}
+            disabled={boxes.length === 0}
             className="flex-1 rounded-lg px-3 py-1.5 bg-accent-600 hover:bg-accent-500 text-white text-xs font-semibold transition-colors disabled:opacity-40"
           >
-            Extract {points.length || ''} character{points.length === 1 ? '' : 's'}
+            Extract {boxes.length || ''} character{boxes.length === 1 ? '' : 's'}
           </button>
           <button
             id={`picker-clear-${idSuffix}`}
-            onClick={() => setPoints([])}
-            disabled={points.length === 0}
+            onClick={() => setBoxes([])}
+            disabled={boxes.length === 0}
             className="rounded-lg px-3 py-1.5 glass border border-surface-500/40 text-surface-200/60 text-xs transition-colors hover:text-surface-200 disabled:opacity-40"
           >
             Clear
           </button>
           <button
             id={`picker-cancel-${idSuffix}`}
-            onClick={() => { setPicking(false); setPoints([]) }}
+            onClick={() => { setPicking(false); setBoxes([]) }}
             className="rounded-lg px-3 py-1.5 glass border border-surface-500/40 text-surface-200/60 text-xs transition-colors hover:text-surface-200"
           >
             Cancel
@@ -166,7 +229,7 @@ export default function LayerResults({
         <div className="text-xs text-red-400">
           Layer split failed: {state.error}
         </div>
-        <PickButton idSuffix={idSuffix} onClick={() => { setPoints([]); setPicking(true) }} />
+        <PickButton idSuffix={idSuffix} onClick={() => { setBoxes([]); setPicking(true) }} />
       </div>
     )
   }
@@ -188,10 +251,10 @@ export default function LayerResults({
         <div className="text-[10px] text-surface-200/30 uppercase tracking-widest">
           Layers · {state.layers.characters.length} character
           {state.layers.characters.length === 1 ? '' : 's'}
-          {state.layers.splitMode === 'points' ? ' · manual' : ''}
+          {state.layers.splitMode === 'boxes' ? ' · manual' : ''}
           {' · '}{state.layers.processingMs.toFixed(0)} ms
         </div>
-        <PickButton idSuffix={idSuffix} onClick={() => { setPoints([]); setPicking(true) }} />
+        <PickButton idSuffix={idSuffix} onClick={() => { setBoxes([]); setPicking(true) }} />
       </div>
       <div className="grid grid-cols-3 gap-2">
         {layers.map(layer => (
@@ -239,12 +302,8 @@ function PickButton({ idSuffix, onClick }: { idSuffix: string | number; onClick:
 function TargetIcon({ size = 12 }: { size?: number }) {
   return (
     <svg width={size} height={size} fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-      <circle cx="12" cy="12" r="9" />
-      <circle cx="12" cy="12" r="3" />
-      <line x1="12" y1="1" x2="12" y2="5" />
-      <line x1="12" y1="19" x2="12" y2="23" />
-      <line x1="1" y1="12" x2="5" y2="12" />
-      <line x1="19" y1="12" x2="23" y2="12" />
+      <rect x="4" y="4" width="16" height="16" rx="2" />
+      <path strokeLinecap="round" d="M4 9h4M4 15h4M16 9h4M16 15h4M9 4v4M15 4v4M9 16v4M15 16v4" />
     </svg>
   )
 }

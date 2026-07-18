@@ -73,10 +73,10 @@ class BatchSplitResponse(BaseModel):
 
 class DecomposeRequest(BaseModel):
     image_b64: str                     # base64-encoded panel image (JPEG/PNG)
-    points: list[tuple[int, int]] | None = None
-    # Optional character click points in image pixel coordinates. When
-    # given, one character layer is extracted per click via FastSAM point
-    # prompts instead of the automatic instance split.
+    boxes: list[tuple[int, int, int, int]] | None = None
+    # Optional character boxes (x0, y0, x1, y1) in image pixel
+    # coordinates. When given, one character layer is extracted per box
+    # via FastSAM box prompts instead of the automatic instance split.
 
 
 class DecomposeResponse(BaseModel):
@@ -189,7 +189,7 @@ def decompose(req: DecomposeRequest) -> DecomposeResponse:
 
     t0 = time.perf_counter()
     try:
-        result: DecomposeResult = decompose_panel(image_bytes, points=req.points)
+        result: DecomposeResult = decompose_panel(image_bytes, boxes=req.boxes)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
