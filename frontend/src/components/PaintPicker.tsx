@@ -31,6 +31,9 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
   const undoStackRef = useRef<Uint8Array[]>([])
   const redoStackRef = useRef<Uint8Array[]>([])
   const strokeSnapshotTakenRef = useRef(false)
+  // Last point painted (natural image coords) — Photoshop-style shift+click
+  // paints a straight line from here to the new click point.
+  const lastPointRef = useRef<{ x: number; y: number } | null>(null)
 
   const [ready, setReady] = useState(false)
   const [categories, setCategories] = useState<Category[]>([
@@ -135,7 +138,9 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
 
     for (let y = y0; y <= y1; y++) {
       for (let x = x0; x <= x1; x++) {
-        const dx = x - cx, dy = y - cy
+        // +0.5 treats (x, y) as a pixel's center rather than its corner,
+        // so the painted circle is geometrically centered on (cx, cy).
+        const dx = x + 0.5 - cx, dy = y + 0.5 - cy
         if (dx * dx + dy * dy > r * r) continue
         const idx = y * w + x
         ownerMap[idx] = categoryId
@@ -143,8 +148,22 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
       }
     }
     setPaintedIds(prev => (prev.has(categoryId) ? prev : new Set(prev).add(categoryId)))
+    lastPointRef.current = { x: cx, y: cy }
     scheduleRedraw()
   }, [brushRadius, categoryById, scheduleRedraw])
+
+  // Photoshop-style shift+click: stamp overlapping dabs along the segment
+  // from the last painted point to (cx, cy) so the stroke looks continuous
+  // rather than a series of separate circles.
+  const paintLine = useCallback((x0: number, y0: number, x1: number, y1: number, categoryId: number) => {
+    const dist = Math.hypot(x1 - x0, y1 - y0)
+    const step = Math.max(1, brushRadius / 3)
+    const steps = Math.max(1, Math.ceil(dist / step))
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps
+      paintAt(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, categoryId)
+    }
+  }, [brushRadius, paintAt])
 
   const toImageCoords = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current!
@@ -166,15 +185,29 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
     paintingRef.current = true
     strokeSnapshotTakenRef.current = false
     const { x, y } = toImageCoords(e)
-    paintAt(x, y, activeId)
-  }, [toImageCoords, paintAt, activeId])
+    if (e.shiftKey && lastPointRef.current) {
+      const { x: lx, y: ly } = lastPointRef.current
+      paintLine(lx, ly, x, y, activeId)
+      // A shift+click is a discrete action, not the start of a drag —
+      // ignore any further movement until the button is released again.
+      paintingRef.current = false
+    } else {
+      paintAt(x, y, activeId)
+    }
+  }, [toImageCoords, paintAt, paintLine, activeId])
 
   const onMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const { x, y, displayX, displayY, scale } = toImageCoords(e)
     setCursor({ x: displayX, y: displayY, scale })
     if (!paintingRef.current) return
-    paintAt(x, y, activeId)
-  }, [toImageCoords, paintAt, activeId])
+    // Connect to the previous sample instead of stamping a single dab —
+    // on a fast drag the browser can report mousemove far less often than
+    // the pointer actually travels, leaving visible gaps and making the
+    // cursor ring look ahead of / uncentered on the painted trail.
+    const prev = lastPointRef.current
+    if (prev) paintLine(prev.x, prev.y, x, y, activeId)
+    else paintAt(x, y, activeId)
+  }, [toImageCoords, paintAt, paintLine, activeId])
 
   const stopPainting = useCallback(() => { paintingRef.current = false }, [])
   const hideCursor = useCallback(() => { paintingRef.current = false; setCursor(null) }, [])
@@ -259,6 +292,7 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
     pushHistory()
     ownerMap.fill(0)
     setPaintedIds(new Set())
+    lastPointRef.current = null
     rebuildOverlay()
   }, [rebuildOverlay, pushHistory])
 
@@ -355,6 +389,9 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
     <div className="px-3 pb-3 flex flex-col gap-2" id="paint-picker">
       <div className="text-[10px] text-surface-200/50 uppercase tracking-widest">
         Paint each layer, then extract
+      </div>
+      <div className="text-[10px] text-surface-200/30 -mt-1">
+        Tip: hold Shift and click to draw a straight line from your last stroke
       </div>
 
       {/* Category chips */}
