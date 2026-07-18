@@ -4,6 +4,7 @@ ComChop – FastAPI Application Server
 
 from __future__ import annotations
 
+import base64
 import logging
 import time
 
@@ -11,6 +12,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from app.services.decomposer import DecomposeResult, decompose_panel
 from app.services.splitter import SplitResult, split_panels
 
 MAX_UPLOAD_BYTES = 30 * 1024 * 1024  # 30 MB
@@ -67,6 +69,18 @@ class ComicSplitResult(BaseModel):
 class BatchSplitResponse(BaseModel):
     results: list[ComicSplitResult]
     total_processing_time_ms: float
+
+
+class DecomposeRequest(BaseModel):
+    image_b64: str                     # base64-encoded panel image (JPEG/PNG)
+
+
+class DecomposeResponse(BaseModel):
+    characters: list[str]              # base64 PNGs (RGBA), one per character
+    bubbles: str                       # base64 PNG (RGBA)
+    background: str                    # base64 PNG (inpainted)
+    metadata: dict
+    processing_time_ms: float
 
 
 class HealthResponse(BaseModel):
@@ -146,6 +160,48 @@ async def split_comic(
         rows=result.rows,
         cols=result.cols,
         grid=result.grid,
+        metadata=result.metadata,
+        processing_time_ms=round(elapsed_ms, 2),
+    )
+
+
+@app.post("/api/decompose", response_model=DecomposeResponse, tags=["Decomposer"])
+def decompose(req: DecomposeRequest) -> DecomposeResponse:
+    """
+    Decompose a single panel image into character / speech-bubble /
+    background layers. Characters are segmented with a local U2Net model,
+    bubbles with classical CV, and the background is inpainted.
+
+    Defined as a sync route so FastAPI runs it in the threadpool — U2Net
+    inference takes a few seconds on CPU and must not block the event loop.
+    """
+    try:
+        image_bytes = base64.b64decode(req.image_b64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 image data.")
+
+    if len(image_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Image must be under 30 MB.")
+
+    t0 = time.perf_counter()
+    try:
+        result: DecomposeResult = decompose_panel(image_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Decomposer failed: %s", exc)
+        raise HTTPException(status_code=422, detail=f"Processing error: {exc}")
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    logger.info(
+        "Decomposed panel (%dx%d) in %.1f ms",
+        result.metadata.get("width", 0), result.metadata.get("height", 0), elapsed_ms,
+    )
+
+    return DecomposeResponse(
+        characters=result.characters,
+        bubbles=result.bubbles,
+        background=result.background,
         metadata=result.metadata,
         processing_time_ms=round(elapsed_ms, 2),
     )

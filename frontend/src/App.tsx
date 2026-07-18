@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef } from 'react'
 import ComicUploader from './components/ComicUploader'
 import PanelGrid, { Panel } from './components/PanelGrid'
+import LayerResults, { LayersState, decomposeImage } from './components/LayerResults'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface ComicSplitResult {
@@ -36,6 +37,15 @@ interface AppState {
   error: string | null
 }
 
+type Mode = 'split' | 'layers'
+
+// One directly-uploaded panel in "layers" mode
+interface DirectItem {
+  filename: string
+  b64: string
+  layers: LayersState
+}
+
 // ── Settings defaults ─────────────────────────────────────────────────────────
 const DEFAULT_WHITE_MEDIAN_THRESHOLD = 200
 const DEFAULT_GUTTER_STD_THRESHOLD = 30
@@ -54,11 +64,50 @@ export default function App() {
   const [minPanel, setMinPanel] = useState(DEFAULT_MIN_PANEL)
   const [showSettings, setShowSettings] = useState(false)
 
+  // Upload mode: split a full comic into panels, or decompose
+  // already-cut panels straight into layers.
+  const [mode, setMode] = useState<Mode>('split')
+  const [directItems, setDirectItems] = useState<DirectItem[]>([])
+
   // Keep the last uploaded files around so "re-run" can resend them with
   // new parameter values without requiring the user to re-upload.
   const lastFilesRef = useRef<File[]>([])
 
-  const handleUpload = useCallback(async (files: File[]) => {
+  const handleDirectUpload = useCallback(async (files: File[]) => {
+    setState(s => ({ ...s, status: 'processing', error: null }))
+
+    const items: DirectItem[] = await Promise.all(files.map(async f => {
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(reader.result as string)
+        reader.onerror = () => reject(new Error(`Could not read ${f.name}`))
+        reader.readAsDataURL(f)
+      })
+      return {
+        filename: f.name,
+        b64: dataUrl.split(',')[1],
+        layers: { status: 'loading' } as LayersState,
+      }
+    }))
+    setDirectItems(items)
+    setState(s => ({ ...s, status: 'done', comics: [], error: null }))
+
+    // Decompose sequentially — each run is CPU-heavy on the backend.
+    for (let i = 0; i < items.length; i++) {
+      let layers: LayersState
+      try {
+        layers = { status: 'done', layers: await decomposeImage(items[i].b64) }
+      } catch (err) {
+        layers = {
+          status: 'error',
+          error: err instanceof Error ? err.message : 'Unknown error',
+        }
+      }
+      setDirectItems(prev => prev.map((it, j) => (j === i ? { ...it, layers } : it)))
+    }
+  }, [])
+
+  const handleSplitUpload = useCallback(async (files: File[]) => {
     lastFilesRef.current = files
     setState(s => ({ ...s, status: 'processing', error: null }))
 
@@ -101,11 +150,19 @@ export default function App() {
     }
   }, [whiteMedianThreshold, gutterStdThreshold, minPanel])
 
-  const rerun = useCallback(() => {
-    if (lastFilesRef.current.length > 0) handleUpload(lastFilesRef.current)
-  }, [handleUpload])
+  const handleUpload = useCallback((files: File[]) => {
+    if (mode === 'layers') handleDirectUpload(files)
+    else handleSplitUpload(files)
+  }, [mode, handleDirectUpload, handleSplitUpload])
 
-  const reset = () => setState({ status: 'idle', comics: [], error: null })
+  const rerun = useCallback(() => {
+    if (lastFilesRef.current.length > 0) handleSplitUpload(lastFilesRef.current)
+  }, [handleSplitUpload])
+
+  const reset = () => {
+    setState({ status: 'idle', comics: [], error: null })
+    setDirectItems([])
+  }
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -161,12 +218,16 @@ export default function App() {
               Zero-config · Local CV · No ML weights
             </div>
             <h2 className="font-display font-bold text-4xl sm:text-5xl leading-tight mb-4">
-              Drop a comic.{' '}
-              <span className="gradient-text">Get the panels.</span>
+              {mode === 'split' ? (
+                <>Drop a comic.{' '}<span className="gradient-text">Get the panels.</span></>
+              ) : (
+                <>Drop a panel.{' '}<span className="gradient-text">Get the layers.</span></>
+              )}
             </h2>
             <p className="text-surface-200/50 max-w-lg mx-auto text-base leading-relaxed">
-              ComChop uses gutter-density projection to detect panel boundaries in any
-              comic layout — 2×2, 1×4, webtoon strips — without any ML models.
+              {mode === 'split'
+                ? 'ComChop uses gutter-density projection to detect panel boundaries in any comic layout — 2×2, 1×4, webtoon strips.'
+                : 'Already have individual panels? Upload them directly and ComChop separates each into characters, speech bubbles, and background.'}
             </p>
           </div>
         )}
@@ -174,20 +235,42 @@ export default function App() {
         {/* Upload zone */}
         {state.status !== 'done' && (
           <div className="animate-slide-up">
+            {/* Mode toggle */}
+            <div className="flex justify-center mb-5">
+              <div className="glass rounded-xl border border-surface-500/30 p-1 flex gap-1">
+                <ModeTab
+                  id="mode-split-btn"
+                  active={mode === 'split'}
+                  disabled={state.status === 'processing'}
+                  onClick={() => setMode('split')}
+                  label="Split comic"
+                />
+                <ModeTab
+                  id="mode-layers-btn"
+                  active={mode === 'layers'}
+                  disabled={state.status === 'processing'}
+                  onClick={() => setMode('layers')}
+                  label="Layers only"
+                />
+              </div>
+            </div>
+
             <ComicUploader
               onUpload={handleUpload}
               isProcessing={state.status === 'processing'}
             />
-            <SettingsPanel
-              show={showSettings}
-              onToggle={() => setShowSettings(s => !s)}
-              whiteMedianThreshold={whiteMedianThreshold}
-              setWhiteMedianThreshold={setWhiteMedianThreshold}
-              gutterStdThreshold={gutterStdThreshold}
-              setGutterStdThreshold={setGutterStdThreshold}
-              minPanel={minPanel}
-              setMinPanel={setMinPanel}
-            />
+            {mode === 'split' && (
+              <SettingsPanel
+                show={showSettings}
+                onToggle={() => setShowSettings(s => !s)}
+                whiteMedianThreshold={whiteMedianThreshold}
+                setWhiteMedianThreshold={setWhiteMedianThreshold}
+                gutterStdThreshold={gutterStdThreshold}
+                setGutterStdThreshold={setGutterStdThreshold}
+                minPanel={minPanel}
+                setMinPanel={setMinPanel}
+              />
+            )}
           </div>
         )}
 
@@ -205,8 +288,40 @@ export default function App() {
           </div>
         )}
 
+        {/* Direct layer results — "layers only" mode */}
+        {state.status === 'done' && mode === 'layers' && (
+          <div className="grid gap-6 sm:grid-cols-2" id="direct-results">
+            {directItems.map((item, i) => (
+              <div
+                key={`${item.filename}-${i}`}
+                id={`direct-item-${i}`}
+                className="panel-card glass rounded-xl overflow-hidden border border-surface-500/40"
+              >
+                <div className="bg-surface-900/40">
+                  <img
+                    src={`data:image/png;base64,${item.b64}`}
+                    alt={item.filename}
+                    className="w-full h-auto object-contain max-h-80"
+                    loading="lazy"
+                  />
+                </div>
+                <div className="px-3 py-2">
+                  <span className="text-xs text-surface-200/40 font-mono truncate block">
+                    {item.filename}
+                  </span>
+                </div>
+                <LayerResults
+                  state={item.layers}
+                  baseName={item.filename.replace(/\.[^.]+$/, '')}
+                  idSuffix={`direct-${i}`}
+                />
+              </div>
+            ))}
+          </div>
+        )}
+
         {/* Results — one section per uploaded comic, kept separate */}
-        {state.status === 'done' && (
+        {state.status === 'done' && mode === 'split' && (
           <div className="flex flex-col gap-12">
             {/* Not happy with a result? Tweak the settings and re-run without re-uploading */}
             <div className="glass rounded-2xl border border-surface-500/30 p-5 animate-fade-in">
@@ -307,6 +422,33 @@ export default function App() {
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
+function ModeTab({
+  id, active, disabled, onClick, label,
+}: {
+  id: string
+  active: boolean
+  disabled: boolean
+  onClick: () => void
+  label: string
+}) {
+  return (
+    <button
+      id={id}
+      onClick={onClick}
+      disabled={disabled}
+      className={`
+        rounded-lg px-4 py-1.5 text-sm font-semibold transition-colors duration-150
+        ${active
+          ? 'bg-brand-600 text-white'
+          : 'text-surface-200/50 hover:text-surface-200'}
+        disabled:opacity-50
+      `}
+    >
+      {label}
+    </button>
+  )
+}
+
 interface SettingsPanelProps {
   show: boolean
   onToggle: () => void
