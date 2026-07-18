@@ -10,8 +10,9 @@ Splits a single comic panel into three layers:
    out of the bubble layer.
 2. **Characters** – the panel's "content" region (see below) split into
    individual character instances, either automatically (connected
-   components refined by FastSAM) or from user-supplied click points
-   (FastSAM point prompts). Returned as RGBA PNGs ordered left to right.
+   components refined by FastSAM) or from user-drawn boxes (FastSAM
+   box prompts, one box per character). Returned as RGBA PNGs ordered
+   left to right.
 3. **Background** – the panel with characters + bubbles removed and the
    holes filled with OpenCV Telea inpainting.
 
@@ -341,7 +342,7 @@ def _auto_instances(
     subdivided when FastSAM proposes >= 2 sub-masks that each cover a
     substantial share of it — this avoids shattering one character into
     head/body parts, at the cost of keeping heavily-overlapping
-    characters merged (use click points for those).
+    characters merged (draw boxes for those).
     """
     char_area = int(np.count_nonzero(char_mask))
     if char_area == 0:
@@ -427,70 +428,66 @@ def _centroid_x(m: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Character instances — user click points
+# Character instances — user-drawn boxes
 # ---------------------------------------------------------------------------
-def _point_instances(
+def _box_instances(
     bgr: np.ndarray,
-    points: list[tuple[int, int]],
-    group_cap_ratio: float = 0.70,
+    boxes: list[tuple[int, int, int, int]],
 ) -> list[np.ndarray]:
     """
-    One FastSAM point-prompt per click. The prompt returns nested
-    candidates (part / object / group). Selection rule: prefer the
-    largest candidate that does NOT contain any *other* click point —
-    each click is one character, so a mask swallowing two clicks is a
-    group. With a single click that rule can't discriminate, so
-    group-level masks covering most of the panel's ink are dropped
-    instead. Pixels claimed by an earlier click are excluded from later
-    ones.
+    One FastSAM box-prompt per drawn rectangle (x0, y0, x1, y1). A box
+    is a far stronger SAM signal than a point — it spatially excludes
+    whatever's outside it, so overlapping characters separate reliably
+    as long as each box is drawn tight around one figure. All boxes are
+    passed in a single call (FastSAM batches box prompts natively), one
+    output mask per input box, in order. Pixels claimed by an earlier
+    box are excluded from later ones so overlapping boxes don't produce
+    overlapping character layers.
     """
     h, w = bgr.shape[:2]
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    ink_area = max(int(np.count_nonzero(gray < 200)), 1)
+    norm_boxes = []
+    for (x0, y0, x1, y1) in boxes:
+        nx0, nx1 = sorted((int(np.clip(x0, 0, w - 1)), int(np.clip(x1, 0, w - 1))))
+        ny0, ny1 = sorted((int(np.clip(y0, 0, h - 1)), int(np.clip(y1, 0, h - 1))))
+        if nx1 - nx0 >= 2 and ny1 - ny0 >= 2:
+            norm_boxes.append([nx0, ny0, nx1, ny1])
 
-    pts = [(int(np.clip(px, 0, w - 1)), int(np.clip(py, 0, h - 1)))
-           for (px, py) in points]
+    if not norm_boxes:
+        return []
+
+    masks_out: list[np.ndarray | None] = [None] * len(norm_boxes)
+    try:
+        results = _get_sam()(
+            bgr, device="cpu", retina_masks=True, imgsz=640,
+            bboxes=norm_boxes, verbose=False,
+        )
+        r = results[0]
+        if r.masks is not None:
+            for i, m in enumerate(r.masks.data.cpu().numpy()):
+                if i >= len(norm_boxes):
+                    break
+                inst = (m > 0.5).astype(np.uint8) * 255
+                if inst.shape != (h, w):
+                    inst = cv2.resize(inst, (w, h), interpolation=cv2.INTER_NEAREST)
+                masks_out[i] = inst
+    except Exception as exc:
+        logger.warning("FastSAM box prompt failed: %s", exc)
 
     instances: list[np.ndarray] = []
     claimed = np.zeros((h, w), dtype=np.uint8)
-    for idx, (px, py) in enumerate(pts):
-        other_pts = [p for i, p in enumerate(pts) if i != idx]
-        best: np.ndarray | None = None
-        try:
-            results = _get_sam()(
-                bgr, device="cpu", retina_masks=True, imgsz=640,
-                points=[[px, py]], labels=[1], verbose=False,
-            )
-            r = results[0]
-            if r.masks is not None:
-                cands = []
-                for m in r.masks.data.cpu().numpy():
-                    inst = (m > 0.5).astype(np.uint8) * 255
-                    if inst.shape != (h, w):
-                        inst = cv2.resize(inst, (w, h),
-                                          interpolation=cv2.INTER_NEAREST)
-                    if inst[py, px] == 0:
-                        continue
-                    cands.append((int(np.count_nonzero(inst)), inst))
-                exclusive = [(a, m) for a, m in cands
-                             if not any(m[oy, ox] > 0 for (ox, oy) in other_pts)]
-                non_group = [(a, m) for a, m in cands
-                             if a <= group_cap_ratio * ink_area]
-                pool = exclusive or non_group or cands
-                if pool:
-                    _, best = max(pool, key=lambda t: t[0])
-        except Exception as exc:
-            logger.warning("FastSAM point prompt failed at (%d,%d): %s",
-                           px, py, exc)
-
-        if best is None:
-            continue
-        rest = cv2.bitwise_and(best, cv2.bitwise_not(claimed))
+    for i, inst in enumerate(masks_out):
+        if inst is None:
+            # Fall back to the raw box region when SAM returns nothing
+            # for this prompt (e.g. a box over a flat, edgeless area).
+            x0, y0, x1, y1 = norm_boxes[i]
+            inst = np.zeros((h, w), dtype=np.uint8)
+            inst[y0:y1, x0:x1] = 255
+        rest = cv2.bitwise_and(inst, cv2.bitwise_not(claimed))
         if np.count_nonzero(rest) > 0:
             instances.append(rest)
             claimed = cv2.bitwise_or(claimed, rest)
 
-    logger.info("Point instances: %d from %d clicks", len(instances), len(points))
+    logger.info("Box instances: %d from %d boxes", len(instances), len(boxes))
     return instances
 
 
@@ -516,14 +513,14 @@ def _layer_rgba(bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 def decompose_panel(
     image_bytes: bytes,
-    points: list[tuple[int, int]] | None = None,
+    boxes: list[tuple[int, int, int, int]] | None = None,
 ) -> DecomposeResult:
     """
     Decompose a comic panel into character / bubble / background layers.
 
-    `points`: optional click coordinates (pixel space of the input
-    image). When given, character extraction is driven by FastSAM point
-    prompts — one character per click — instead of the automatic split.
+    `boxes`: optional (x0, y0, x1, y1) rectangles in the pixel space of
+    the input image, one per character. When given, character extraction
+    is driven by FastSAM box prompts instead of the automatic split.
     """
     arr = np.frombuffer(image_bytes, dtype=np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -542,14 +539,14 @@ def decompose_panel(
     bubble_dilated = cv2.dilate(bubble_mask, sub_kernel, iterations=2)
     char_region = cv2.bitwise_and(content, cv2.bitwise_not(bubble_dilated))
 
-    if points:
-        instance_masks = _point_instances(bgr, points)
+    if boxes:
+        instance_masks = _box_instances(bgr, boxes)
         for i, m in enumerate(instance_masks):
             instance_masks[i] = cv2.bitwise_and(
                 m, cv2.bitwise_not(bubble_dilated))
         instance_masks = [m for m in instance_masks if np.count_nonzero(m)]
         instance_masks.sort(key=_centroid_x)
-        split_mode = "points"
+        split_mode = "boxes"
     else:
         instance_masks = _auto_instances(bgr, char_region)
         split_mode = "auto"
