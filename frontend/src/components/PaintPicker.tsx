@@ -36,6 +36,7 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
   const [brushRadius, setBrushRadius] = useState(24)
   const [bgColor, setBgColor] = useState('#ffffff')
   const [paintedIds, setPaintedIds] = useState<Set<number>>(new Set())
+  const [cursor, setCursor] = useState<{ x: number; y: number; scale: number } | null>(null)
 
   // ── Load image into canvas ────────────────────────────────────────────
   useEffect(() => {
@@ -135,6 +136,11 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
     return {
       x: (e.clientX - rect.left) * scaleX,
       y: (e.clientY - rect.top) * scaleY,
+      // Display px per natural px — used to size the brush cursor to match
+      // the actual painted radius regardless of how the canvas is scaled.
+      displayX: e.clientX - rect.left,
+      displayY: e.clientY - rect.top,
+      scale: rect.width / canvas.width,
     }
   }, [])
 
@@ -145,12 +151,14 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
   }, [toImageCoords, paintAt, activeId])
 
   const onMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const { x, y, displayX, displayY, scale } = toImageCoords(e)
+    setCursor({ x: displayX, y: displayY, scale })
     if (!paintingRef.current) return
-    const { x, y } = toImageCoords(e)
     paintAt(x, y, activeId)
   }, [toImageCoords, paintAt, activeId])
 
   const stopPainting = useCallback(() => { paintingRef.current = false }, [])
+  const hideCursor = useCallback(() => { paintingRef.current = false; setCursor(null) }, [])
 
   const rebuildOverlay = useCallback(() => {
     const { w, h } = sizeRef.current
@@ -307,12 +315,26 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
       <div className="relative rounded-lg overflow-hidden border border-accent-500/50">
         <canvas
           ref={canvasRef}
-          className="w-full h-auto block cursor-crosshair select-none"
+          className="w-full h-auto block cursor-none select-none"
           onMouseDown={onMouseDown}
           onMouseMove={onMouseMove}
           onMouseUp={stopPainting}
-          onMouseLeave={stopPainting}
+          onMouseLeave={hideCursor}
         />
+        {cursor && (
+          <div
+            className="absolute rounded-full border-2 pointer-events-none"
+            style={{
+              left: cursor.x,
+              top: cursor.y,
+              width: brushRadius * 2 * cursor.scale,
+              height: brushRadius * 2 * cursor.scale,
+              transform: 'translate(-50%, -50%)',
+              borderColor: activeId === 0 ? '#e2e4f0' : (activeCat?.color ?? '#e2e4f0'),
+              backgroundColor: activeId === 0 ? 'transparent' : `${activeCat?.color ?? '#e2e4f0'}33`,
+            }}
+          />
+        )}
         {!ready && (
           <div className="absolute inset-0 flex items-center justify-center bg-surface-900/60 text-xs text-surface-200/50">
             Loading…
