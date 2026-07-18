@@ -1,4 +1,5 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useState } from 'react'
+import PaintPicker from './PaintPicker'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 export interface DecomposeResponse {
@@ -22,18 +23,12 @@ export type LayersState =
   | { status: 'done'; layers: LayerSet }
   | { status: 'error'; error: string }
 
-/** (x0, y0, x1, y1) in the original image's pixel coordinates. */
-export type Box = [number, number, number, number]
-
-// ── API helper ───────────────────────────────────────────────────────────────
-export async function decomposeImage(
-  imageB64: string,
-  boxes?: Box[],
-): Promise<LayerSet> {
+// ── API helper (auto mode only — manual mode runs entirely client-side) ──────
+export async function decomposeImage(imageB64: string): Promise<LayerSet> {
   const res = await fetch('/api/decompose', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ image_b64: imageB64, boxes: boxes ?? null }),
+    body: JSON.stringify({ image_b64: imageB64 }),
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }))
@@ -54,20 +49,18 @@ interface Props {
   state: LayersState | undefined
   baseName: string
   idSuffix: string | number
-  /** Original image (base64) — needed for the manual character picker. */
+  /** Original image (base64) — needed for the manual paint picker. */
   imageB64: string
-  /** Re-run decomposition; `boxes` are pixel rects in the original image. */
-  onDecompose: (boxes?: Box[]) => void
+  /** Re-run automatic (server) decomposition. */
+  onDecompose: () => void
+  /** Apply a manually-painted layer set (computed entirely in the browser). */
+  onManualResult: (layers: LayerSet) => void
 }
 
 export default function LayerResults({
-  state, baseName, idSuffix, imageB64, onDecompose,
+  state, baseName, idSuffix, imageB64, onDecompose, onManualResult,
 }: Props) {
-  const [picking, setPicking] = useState(false)
-  const [boxes, setBoxes] = useState<Box[]>([])
-  const [draft, setDraft] = useState<Box | null>(null)
-  const dragStart = useRef<{ x: number; y: number } | null>(null)
-  const imgRef = useRef<HTMLImageElement>(null)
+  const [painting, setPainting] = useState(false)
 
   const downloadLayer = useCallback((b64: string, name: string) => {
     const link = document.createElement('a')
@@ -76,51 +69,10 @@ export default function LayerResults({
     link.click()
   }, [])
 
-  const toImageCoords = useCallback((e: { clientX: number; clientY: number }) => {
-    const img = imgRef.current
-    if (!img) return { x: 0, y: 0 }
-    const rect = img.getBoundingClientRect()
-    const x = Math.round((e.clientX - rect.left) / rect.width * img.naturalWidth)
-    const y = Math.round((e.clientY - rect.top) / rect.height * img.naturalHeight)
-    return {
-      x: Math.max(0, Math.min(img.naturalWidth, x)),
-      y: Math.max(0, Math.min(img.naturalHeight, y)),
-    }
-  }, [])
-
-  const onDragStart = useCallback((e: React.MouseEvent<HTMLImageElement>) => {
-    const { x, y } = toImageCoords(e)
-    dragStart.current = { x, y }
-    setDraft([x, y, x, y])
-  }, [toImageCoords])
-
-  const onDragMove = useCallback((e: React.MouseEvent<HTMLImageElement>) => {
-    if (!dragStart.current) return
-    const { x, y } = toImageCoords(e)
-    setDraft([dragStart.current.x, dragStart.current.y, x, y])
-  }, [toImageCoords])
-
-  const onDragEnd = useCallback(() => {
-    if (!dragStart.current || !draft) { dragStart.current = null; return }
-    const [x0, y0, x1, y1] = draft
-    if (Math.abs(x1 - x0) >= 6 && Math.abs(y1 - y0) >= 6) {
-      setBoxes(bs => [...bs, [
-        Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1),
-      ]])
-    }
-    dragStart.current = null
-    setDraft(null)
-  }, [draft])
-
-  const removeBox = useCallback((i: number) => {
-    setBoxes(bs => bs.filter((_, j) => j !== i))
-  }, [])
-
-  const applyBoxes = useCallback(() => {
-    if (boxes.length === 0) return
-    setPicking(false)
-    onDecompose(boxes)
-  }, [boxes, onDecompose])
+  const applyPaint = useCallback((layers: LayerSet) => {
+    setPainting(false)
+    onManualResult(layers)
+  }, [onManualResult])
 
   if (!state) return null
 
@@ -133,93 +85,14 @@ export default function LayerResults({
     )
   }
 
-  // ── Manual character picker ──────────────────────────────────────────
-  if (picking) {
-    const img = imgRef.current
-    const toPct = (px: number, py: number) => ({
-      left: img ? (px / img.naturalWidth) * 100 : 0,
-      top: img ? (py / img.naturalHeight) * 100 : 0,
-    })
-    const boxStyle = ([x0, y0, x1, y1]: Box) => {
-      const a = toPct(x0, y0)
-      const b = toPct(x1, y1)
-      return {
-        left: `${Math.min(a.left, b.left)}%`,
-        top: `${Math.min(a.top, b.top)}%`,
-        width: `${Math.abs(b.left - a.left)}%`,
-        height: `${Math.abs(b.top - a.top)}%`,
-      }
-    }
-
+  // ── Manual paint picker ──────────────────────────────────────────────
+  if (painting) {
     return (
-      <div className="px-3 pb-3 flex flex-col gap-2" id={`picker-${idSuffix}`}>
-        <div className="text-[10px] text-surface-200/50 uppercase tracking-widest">
-          Drag a box around each character ({boxes.length} selected)
-        </div>
-        <div
-          className="relative rounded-lg overflow-hidden border border-accent-500/50 cursor-crosshair select-none"
-          onMouseLeave={onDragEnd}
-        >
-          <img
-            ref={imgRef}
-            src={`data:image/png;base64,${imageB64}`}
-            alt="Pick characters"
-            className="w-full h-auto object-contain select-none"
-            onMouseDown={onDragStart}
-            onMouseMove={onDragMove}
-            onMouseUp={onDragEnd}
-            draggable={false}
-          />
-          {boxes.map((box, i) => (
-            <div
-              key={i}
-              className="absolute border-2 border-accent-500 bg-accent-500/15 group"
-              style={boxStyle(box)}
-            >
-              <span className="absolute -top-2.5 -left-2.5 w-5 h-5 rounded-full bg-accent-500 border-2 border-white text-white text-[10px] font-bold flex items-center justify-center shadow">
-                {i + 1}
-              </span>
-              <button
-                onClick={(e) => { e.stopPropagation(); removeBox(i) }}
-                className="absolute -top-2.5 -right-2.5 w-5 h-5 rounded-full bg-surface-900 border-2 border-white text-white text-[10px] font-bold flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-              >
-                ×
-              </button>
-            </div>
-          ))}
-          {draft && (
-            <div
-              className="absolute border-2 border-dashed border-accent-400 bg-accent-400/10 pointer-events-none"
-              style={boxStyle(draft)}
-            />
-          )}
-        </div>
-        <div className="flex gap-2">
-          <button
-            id={`picker-apply-${idSuffix}`}
-            onClick={applyBoxes}
-            disabled={boxes.length === 0}
-            className="flex-1 rounded-lg px-3 py-1.5 bg-accent-600 hover:bg-accent-500 text-white text-xs font-semibold transition-colors disabled:opacity-40"
-          >
-            Extract {boxes.length || ''} character{boxes.length === 1 ? '' : 's'}
-          </button>
-          <button
-            id={`picker-clear-${idSuffix}`}
-            onClick={() => setBoxes([])}
-            disabled={boxes.length === 0}
-            className="rounded-lg px-3 py-1.5 glass border border-surface-500/40 text-surface-200/60 text-xs transition-colors hover:text-surface-200 disabled:opacity-40"
-          >
-            Clear
-          </button>
-          <button
-            id={`picker-cancel-${idSuffix}`}
-            onClick={() => { setPicking(false); setBoxes([]) }}
-            className="rounded-lg px-3 py-1.5 glass border border-surface-500/40 text-surface-200/60 text-xs transition-colors hover:text-surface-200"
-          >
-            Cancel
-          </button>
-        </div>
-      </div>
+      <PaintPicker
+        imageB64={imageB64}
+        onApply={applyPaint}
+        onCancel={() => setPainting(false)}
+      />
     )
   }
 
@@ -229,7 +102,16 @@ export default function LayerResults({
         <div className="text-xs text-red-400">
           Layer split failed: {state.error}
         </div>
-        <PickButton idSuffix={idSuffix} onClick={() => { setBoxes([]); setPicking(true) }} />
+        <div className="flex items-center gap-3">
+          <button
+            id={`retry-auto-${idSuffix}`}
+            onClick={onDecompose}
+            className="text-[10px] text-brand-400 hover:text-brand-300 transition-colors"
+          >
+            Retry auto
+          </button>
+          <PaintButton idSuffix={idSuffix} onClick={() => setPainting(true)} />
+        </div>
       </div>
     )
   }
@@ -251,10 +133,10 @@ export default function LayerResults({
         <div className="text-[10px] text-surface-200/30 uppercase tracking-widest">
           Layers · {state.layers.characters.length} character
           {state.layers.characters.length === 1 ? '' : 's'}
-          {state.layers.splitMode === 'boxes' ? ' · manual' : ''}
+          {state.layers.splitMode === 'paint' ? ' · manual' : ''}
           {' · '}{state.layers.processingMs.toFixed(0)} ms
         </div>
-        <PickButton idSuffix={idSuffix} onClick={() => { setBoxes([]); setPicking(true) }} />
+        <PaintButton idSuffix={idSuffix} onClick={() => setPainting(true)} />
       </div>
       <div className="grid grid-cols-3 gap-2">
         {layers.map(layer => (
@@ -286,24 +168,23 @@ export default function LayerResults({
   )
 }
 
-function PickButton({ idSuffix, onClick }: { idSuffix: string | number; onClick: () => void }) {
+function PaintButton({ idSuffix, onClick }: { idSuffix: string | number; onClick: () => void }) {
   return (
     <button
-      id={`pick-characters-${idSuffix}`}
+      id={`paint-layers-${idSuffix}`}
       onClick={onClick}
       className="text-[10px] text-accent-400 hover:text-accent-500 transition-colors flex items-center gap-1 flex-shrink-0"
     >
-      <TargetIcon size={11} />
-      Pick characters
+      <BrushIcon size={11} />
+      Paint layers
     </button>
   )
 }
 
-function TargetIcon({ size = 12 }: { size?: number }) {
+function BrushIcon({ size = 12 }: { size?: number }) {
   return (
     <svg width={size} height={size} fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-      <rect x="4" y="4" width="16" height="16" rx="2" />
-      <path strokeLinecap="round" d="M4 9h4M4 15h4M16 9h4M16 15h4M9 4v4M15 4v4M9 16v4M15 16v4" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M9.53 16.122a3 3 0 00-5.78 1.128 2.25 2.25 0 01-2.4 2.245 4.5 4.5 0 008.4-2.245c0-.399-.078-.78-.22-1.128zm0 0a15.998 15.998 0 003.388-1.62m-5.043-.025a15.994 15.994 0 011.622-3.395m3.42 3.42a15.995 15.995 0 004.764-4.648l3.876-5.814a1.151 1.151 0 00-1.597-1.597L14.146 6.32a15.996 15.996 0 00-4.649 4.763m3.42 3.42a6.776 6.776 0 00-3.42-3.42" />
     </svg>
   )
 }
