@@ -1,5 +1,6 @@
-import { useCallback } from 'react'
+import { useCallback, useState } from 'react'
 import JSZip from 'jszip'
+import LayerResults, { LayersState, decomposeImage } from './LayerResults'
 
 export interface Panel {
   b64: string      // base64 PNG
@@ -19,6 +20,25 @@ interface Props {
 export default function PanelGrid({ panels, rows, cols, processingMs, originalName }: Props) {
   // Strip extension from original filename to use as base name
   const baseName = originalName.replace(/\.[^.]+$/, '')
+
+  // Layer decomposition state, keyed by panel index
+  const [layersByPanel, setLayersByPanel] = useState<Record<number, LayersState>>({})
+
+  const decomposePanel = useCallback(async (panel: Panel) => {
+    setLayersByPanel(s => ({ ...s, [panel.index]: { status: 'loading' } }))
+    try {
+      const layers = await decomposeImage(panel.b64)
+      setLayersByPanel(s => ({ ...s, [panel.index]: { status: 'done', layers } }))
+    } catch (err) {
+      setLayersByPanel(s => ({
+        ...s,
+        [panel.index]: {
+          status: 'error',
+          error: err instanceof Error ? err.message : 'Unknown error',
+        },
+      }))
+    }
+  }, [])
 
   const downloadSingle = useCallback((panel: Panel) => {
     const link = document.createElement('a')
@@ -101,19 +121,35 @@ export default function PanelGrid({ panels, rows, cols, processingMs, originalNa
                 bg-surface-900/70 opacity-0 group-hover:opacity-100
                 transition-opacity duration-200 rounded-t-xl
               ">
-                <button
-                  id={`download-panel-${panel.index}`}
-                  onClick={() => downloadSingle(panel)}
-                  className="
-                    glass border border-brand-500/50 rounded-xl
-                    px-4 py-2 text-sm font-semibold text-brand-300
-                    hover:bg-brand-600/30 transition-colors duration-150
-                    flex items-center gap-2
-                  "
-                >
-                  <DownloadIcon size={14} />
-                  Save PNG
-                </button>
+                <div className="flex flex-col items-center gap-2">
+                  <button
+                    id={`download-panel-${panel.index}`}
+                    onClick={() => downloadSingle(panel)}
+                    className="
+                      glass border border-brand-500/50 rounded-xl
+                      px-4 py-2 text-sm font-semibold text-brand-300
+                      hover:bg-brand-600/30 transition-colors duration-150
+                      flex items-center gap-2
+                    "
+                  >
+                    <DownloadIcon size={14} />
+                    Save PNG
+                  </button>
+                  <button
+                    id={`decompose-panel-${panel.index}`}
+                    onClick={() => decomposePanel(panel)}
+                    disabled={layersByPanel[panel.index]?.status === 'loading'}
+                    className="
+                      glass border border-accent-500/50 rounded-xl
+                      px-4 py-2 text-sm font-semibold text-accent-400
+                      hover:bg-accent-600/30 transition-colors duration-150
+                      flex items-center gap-2 disabled:opacity-50
+                    "
+                  >
+                    <LayersIcon size={14} />
+                    Split layers
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -125,10 +161,25 @@ export default function PanelGrid({ panels, rows, cols, processingMs, originalNa
                 R{panel.row + 1} · C{panel.col + 1}
               </span>
             </div>
+
+            <LayerResults
+              state={layersByPanel[panel.index]}
+              baseName={`${baseName}_${panel.index + 1}`}
+              idSuffix={panel.index}
+            />
           </div>
         ))}
       </div>
     </section>
+  )
+}
+
+function LayersIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 3l9 5-9 5-9-5 9-5z" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M3 13l9 5 9-5" />
+    </svg>
   )
 }
 
