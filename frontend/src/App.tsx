@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef } from 'react'
 import ComicUploader from './components/ComicUploader'
 import PanelGrid, { Panel } from './components/PanelGrid'
-import LayerResults, { LayersState, Box, decomposeImage } from './components/LayerResults'
+import LayerResults, { LayersState, LayerSet, decomposeImage } from './components/LayerResults'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface ComicSplitResult {
@@ -107,12 +107,12 @@ export default function App() {
     }
   }, [])
 
-  const redecomposeDirect = useCallback(async (index: number, b64: string, boxes?: Box[]) => {
+  const redecomposeDirect = useCallback(async (index: number, b64: string) => {
     setDirectItems(prev => prev.map((it, j) =>
       j === index ? { ...it, layers: { status: 'loading' } } : it))
     let layers: LayersState
     try {
-      layers = { status: 'done', layers: await decomposeImage(b64, boxes) }
+      layers = { status: 'done', layers: await decomposeImage(b64) }
     } catch (err) {
       layers = {
         status: 'error',
@@ -120,6 +120,11 @@ export default function App() {
       }
     }
     setDirectItems(prev => prev.map((it, j) => (j === index ? { ...it, layers } : it)))
+  }, [])
+
+  const applyManualDirect = useCallback((index: number, layers: LayerSet) => {
+    setDirectItems(prev => prev.map((it, j) =>
+      j === index ? { ...it, layers: { status: 'done', layers } } : it))
   }, [])
 
   const handleSplitUpload = useCallback(async (files: File[]) => {
@@ -330,7 +335,8 @@ export default function App() {
                   baseName={item.filename.replace(/\.[^.]+$/, '')}
                   idSuffix={`direct-${i}`}
                   imageB64={item.b64}
-                  onDecompose={(boxes) => redecomposeDirect(i, item.b64, boxes)}
+                  onDecompose={() => redecomposeDirect(i, item.b64)}
+                  onManualResult={(layers) => applyManualDirect(i, layers)}
                 />
               </div>
             ))}

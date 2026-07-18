@@ -1,6 +1,6 @@
 import { useCallback, useState } from 'react'
 import JSZip from 'jszip'
-import LayerResults, { LayersState, Box, decomposeImage } from './LayerResults'
+import LayerResults, { LayersState, LayerSet, decomposeImage } from './LayerResults'
 
 export interface Panel {
   b64: string      // base64 PNG
@@ -24,10 +24,10 @@ export default function PanelGrid({ panels, rows, cols, processingMs, originalNa
   // Layer decomposition state, keyed by panel index
   const [layersByPanel, setLayersByPanel] = useState<Record<number, LayersState>>({})
 
-  const decomposePanel = useCallback(async (panel: Panel, boxes?: Box[]) => {
+  const decomposePanel = useCallback(async (panel: Panel) => {
     setLayersByPanel(s => ({ ...s, [panel.index]: { status: 'loading' } }))
     try {
-      const layers = await decomposeImage(panel.b64, boxes)
+      const layers = await decomposeImage(panel.b64)
       setLayersByPanel(s => ({ ...s, [panel.index]: { status: 'done', layers } }))
     } catch (err) {
       setLayersByPanel(s => ({
@@ -38,6 +38,10 @@ export default function PanelGrid({ panels, rows, cols, processingMs, originalNa
         },
       }))
     }
+  }, [])
+
+  const applyManualLayers = useCallback((panel: Panel, layers: LayerSet) => {
+    setLayersByPanel(s => ({ ...s, [panel.index]: { status: 'done', layers } }))
   }, [])
 
   const downloadSingle = useCallback((panel: Panel) => {
@@ -167,7 +171,8 @@ export default function PanelGrid({ panels, rows, cols, processingMs, originalNa
               baseName={`${baseName}_${panel.index + 1}`}
               idSuffix={panel.index}
               imageB64={panel.b64}
-              onDecompose={(boxes) => decomposePanel(panel, boxes)}
+              onDecompose={() => decomposePanel(panel)}
+              onManualResult={(layers) => applyManualLayers(panel, layers)}
             />
           </div>
         ))}
