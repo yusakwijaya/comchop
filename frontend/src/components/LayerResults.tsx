@@ -1,4 +1,5 @@
 import { useCallback, useState } from 'react'
+import JSZip from 'jszip'
 import PaintPicker from './PaintPicker'
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -69,6 +70,22 @@ export default function LayerResults({
     link.click()
   }, [])
 
+  const downloadAllLayers = useCallback(async (
+    layerList: { key: string; b64: string }[],
+  ) => {
+    const zip = new JSZip()
+    layerList.forEach(layer => {
+      zip.file(`${baseName}_${layer.key}.png`, layer.b64, { base64: true })
+    })
+    const blob = await zip.generateAsync({ type: 'blob' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${baseName}_layers.zip`
+    link.click()
+    URL.revokeObjectURL(url)
+  }, [baseName])
+
   const applyPaint = useCallback((layers: LayerSet) => {
     setPainting(false)
     onManualResult(layers)
@@ -136,7 +153,17 @@ export default function LayerResults({
           {state.layers.splitMode === 'paint' ? ' · manual' : ''}
           {' · '}{state.layers.processingMs.toFixed(0)} ms
         </div>
-        <PaintButton idSuffix={idSuffix} onClick={() => setPainting(true)} />
+        <div className="flex items-center gap-3 flex-shrink-0">
+          <button
+            id={`download-all-layers-${idSuffix}`}
+            onClick={() => downloadAllLayers(layers)}
+            className="text-[10px] text-surface-200/50 hover:text-brand-300 transition-colors flex items-center gap-1"
+          >
+            <DownloadIcon size={11} />
+            Download all
+          </button>
+          <PaintButton idSuffix={idSuffix} onClick={() => setPainting(true)} />
+        </div>
       </div>
       <div className="grid grid-cols-3 gap-2">
         {layers.map(layer => (

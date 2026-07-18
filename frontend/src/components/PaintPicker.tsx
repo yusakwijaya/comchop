@@ -5,6 +5,7 @@ import type { LayerSet } from './LayerResults'
 const CHAR_COLORS = ['#f97316', '#a855f7', '#22c55e', '#eab308', '#ec4899', '#06b6d4', '#f43f5e', '#84cc16']
 const BUBBLE_ID = 90
 const BUBBLE_COLOR = '#38bdf8'
+const MAX_HISTORY = 40
 
 interface Category {
   id: number
@@ -27,6 +28,9 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
   const paintingRef = useRef(false)
   const dirtyRef = useRef(false)
   const rafRef = useRef<number | null>(null)
+  const undoStackRef = useRef<Uint8Array[]>([])
+  const redoStackRef = useRef<Uint8Array[]>([])
+  const strokeSnapshotTakenRef = useRef(false)
 
   const [ready, setReady] = useState(false)
   const [categories, setCategories] = useState<Category[]>([
@@ -37,6 +41,8 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
   const [bgColor, setBgColor] = useState('#ffffff')
   const [paintedIds, setPaintedIds] = useState<Set<number>>(new Set())
   const [cursor, setCursor] = useState<{ x: number; y: number; scale: number } | null>(null)
+  const [undoCount, setUndoCount] = useState(0)
+  const [redoCount, setRedoCount] = useState(0)
 
   // ── Load image into canvas ────────────────────────────────────────────
   useEffect(() => {
@@ -107,6 +113,18 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
     const overlay = overlayDataRef.current
     if (!ownerMap || !orig || !overlay) return
 
+    // Snapshot once per stroke — right before its first mutation — so
+    // undo reverts a whole stroke, not one brush dab.
+    if (!strokeSnapshotTakenRef.current) {
+      strokeSnapshotTakenRef.current = true
+      const stack = undoStackRef.current
+      stack.push(ownerMap.slice())
+      if (stack.length > MAX_HISTORY) stack.shift()
+      redoStackRef.current = []
+      setUndoCount(stack.length)
+      setRedoCount(0)
+    }
+
     const cat = categoryById(categoryId)
     const color = cat ? hexToRgb(cat.color) : null
     const r = brushRadius
@@ -146,6 +164,7 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
 
   const onMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     paintingRef.current = true
+    strokeSnapshotTakenRef.current = false
     const { x, y } = toImageCoords(e)
     paintAt(x, y, activeId)
   }, [toImageCoords, paintAt, activeId])
@@ -174,23 +193,74 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
     scheduleRedraw()
   }, [categoryById, scheduleRedraw])
 
+  const recomputePaintedIds = useCallback(() => {
+    const ownerMap = ownerMapRef.current
+    if (!ownerMap) return
+    const ids = new Set<number>()
+    for (let i = 0; i < ownerMap.length; i++) {
+      if (ownerMap[i] !== 0) ids.add(ownerMap[i])
+    }
+    setPaintedIds(ids)
+  }, [])
+
+  const pushHistory = useCallback(() => {
+    const ownerMap = ownerMapRef.current
+    if (!ownerMap) return
+    const stack = undoStackRef.current
+    stack.push(ownerMap.slice())
+    if (stack.length > MAX_HISTORY) stack.shift()
+    redoStackRef.current = []
+    setUndoCount(stack.length)
+    setRedoCount(0)
+  }, [])
+
+  const restoreSnapshot = useCallback((snapshot: Uint8Array) => {
+    const ownerMap = ownerMapRef.current
+    if (!ownerMap) return
+    ownerMap.set(snapshot)
+    recomputePaintedIds()
+    rebuildOverlay()
+  }, [recomputePaintedIds, rebuildOverlay])
+
+  const undo = useCallback(() => {
+    const ownerMap = ownerMapRef.current
+    const snapshot = undoStackRef.current.pop()
+    if (!ownerMap || !snapshot) return
+    redoStackRef.current.push(ownerMap.slice())
+    restoreSnapshot(snapshot)
+    setUndoCount(undoStackRef.current.length)
+    setRedoCount(redoStackRef.current.length)
+  }, [restoreSnapshot])
+
+  const redo = useCallback(() => {
+    const ownerMap = ownerMapRef.current
+    const snapshot = redoStackRef.current.pop()
+    if (!ownerMap || !snapshot) return
+    undoStackRef.current.push(ownerMap.slice())
+    restoreSnapshot(snapshot)
+    setUndoCount(undoStackRef.current.length)
+    setRedoCount(redoStackRef.current.length)
+  }, [restoreSnapshot])
+
   const clearCategory = useCallback((id: number) => {
     const ownerMap = ownerMapRef.current
     if (!ownerMap) return
+    pushHistory()
     for (let i = 0; i < ownerMap.length; i++) {
       if (ownerMap[i] === id) ownerMap[i] = 0
     }
     setPaintedIds(prev => { const n = new Set(prev); n.delete(id); return n })
     rebuildOverlay()
-  }, [rebuildOverlay])
+  }, [rebuildOverlay, pushHistory])
 
   const clearAll = useCallback(() => {
     const ownerMap = ownerMapRef.current
     if (!ownerMap) return
+    pushHistory()
     ownerMap.fill(0)
     setPaintedIds(new Set())
     rebuildOverlay()
-  }, [rebuildOverlay])
+  }, [rebuildOverlay, pushHistory])
 
   const addCharacter = useCallback(() => {
     setCategories(prev => {
@@ -264,6 +334,18 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
       splitMode: 'paint',
     })
   }, [categories, paintedIds, buildLayerCanvas, buildBackgroundCanvas, bgColor, onApply])
+
+  // Keyboard shortcuts: Cmd/Ctrl+Z to undo, Shift+Cmd/Ctrl+Z (or Ctrl+Y) to redo.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'z') return
+      e.preventDefault()
+      if (e.shiftKey) redo()
+      else undo()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [undo, redo])
 
   const activeCat = activeId === BUBBLE_ID
     ? { id: BUBBLE_ID, label: 'Bubbles', color: BUBBLE_COLOR }
@@ -344,6 +426,26 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
 
       {/* Brush + bg color controls */}
       <div className="flex items-center gap-4 flex-wrap">
+        <div className="flex items-center gap-1.5">
+          <button
+            id="paint-undo"
+            onClick={undo}
+            disabled={undoCount === 0}
+            title="Undo (Ctrl/Cmd+Z)"
+            className="rounded-lg p-1.5 glass border border-surface-500/40 text-surface-200/60 transition-colors hover:text-surface-200 disabled:opacity-30"
+          >
+            <UndoIcon size={13} />
+          </button>
+          <button
+            id="paint-redo"
+            onClick={redo}
+            disabled={redoCount === 0}
+            title="Redo (Shift+Ctrl/Cmd+Z)"
+            className="rounded-lg p-1.5 glass border border-surface-500/40 text-surface-200/60 transition-colors hover:text-surface-200 disabled:opacity-30"
+          >
+            <UndoIcon size={13} flip />
+          </button>
+        </div>
         <label className="flex items-center gap-2 text-[10px] text-surface-200/60">
           Brush
           <input
@@ -394,6 +496,18 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
         </button>
       </div>
     </div>
+  )
+}
+
+function UndoIcon({ size = 16, flip = false }: { size?: number; flip?: boolean }) {
+  return (
+    <svg
+      width={size} height={size} fill="none" stroke="currentColor" strokeWidth={2}
+      viewBox="0 0 24 24" style={flip ? { transform: 'scaleX(-1)' } : undefined}
+    >
+      <path strokeLinecap="round" strokeLinejoin="round" d="M9 14L4 9l5-5" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M4 9h10.5a5.5 5.5 0 015.5 5.5v0a5.5 5.5 0 01-5.5 5.5H11" />
+    </svg>
   )
 }
 
