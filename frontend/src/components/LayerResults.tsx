@@ -1,4 +1,4 @@
-import { useCallback } from 'react'
+import { useCallback, useRef, useState } from 'react'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 export interface DecomposeResponse {
@@ -14,6 +14,7 @@ export interface LayerSet {
   bubbles: string
   background: string
   processingMs: number
+  splitMode: string
 }
 
 export type LayersState =
@@ -21,12 +22,17 @@ export type LayersState =
   | { status: 'done'; layers: LayerSet }
   | { status: 'error'; error: string }
 
+export type Point = [number, number]
+
 // ── API helper ───────────────────────────────────────────────────────────────
-export async function decomposeImage(imageB64: string): Promise<LayerSet> {
+export async function decomposeImage(
+  imageB64: string,
+  points?: Point[],
+): Promise<LayerSet> {
   const res = await fetch('/api/decompose', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ image_b64: imageB64 }),
+    body: JSON.stringify({ image_b64: imageB64, points: points ?? null }),
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }))
@@ -38,6 +44,7 @@ export async function decomposeImage(imageB64: string): Promise<LayerSet> {
     bubbles: data.bubbles,
     background: data.background,
     processingMs: data.processing_time_ms,
+    splitMode: String(data.metadata?.split_mode ?? 'auto'),
   }
 }
 
@@ -46,15 +53,41 @@ interface Props {
   state: LayersState | undefined
   baseName: string
   idSuffix: string | number
+  /** Original image (base64) — needed for the manual character picker. */
+  imageB64: string
+  /** Re-run decomposition; `points` are pixel coords in the original image. */
+  onDecompose: (points?: Point[]) => void
 }
 
-export default function LayerResults({ state, baseName, idSuffix }: Props) {
+export default function LayerResults({
+  state, baseName, idSuffix, imageB64, onDecompose,
+}: Props) {
+  const [picking, setPicking] = useState(false)
+  const [points, setPoints] = useState<Point[]>([])
+  const imgRef = useRef<HTMLImageElement>(null)
+
   const downloadLayer = useCallback((b64: string, name: string) => {
     const link = document.createElement('a')
     link.href = `data:image/png;base64,${b64}`
     link.download = `${name}.png`
     link.click()
   }, [])
+
+  const addPoint = useCallback((e: React.MouseEvent<HTMLImageElement>) => {
+    const img = imgRef.current
+    if (!img) return
+    const rect = img.getBoundingClientRect()
+    // Map click from displayed size to natural pixel coordinates.
+    const x = Math.round((e.clientX - rect.left) / rect.width * img.naturalWidth)
+    const y = Math.round((e.clientY - rect.top) / rect.height * img.naturalHeight)
+    setPoints(p => [...p, [x, y]])
+  }, [])
+
+  const applyPoints = useCallback(() => {
+    if (points.length === 0) return
+    setPicking(false)
+    onDecompose(points)
+  }, [points, onDecompose])
 
   if (!state) return null
 
@@ -67,10 +100,73 @@ export default function LayerResults({ state, baseName, idSuffix }: Props) {
     )
   }
 
+  // ── Manual character picker ──────────────────────────────────────────
+  if (picking) {
+    return (
+      <div className="px-3 pb-3 flex flex-col gap-2" id={`picker-${idSuffix}`}>
+        <div className="text-[10px] text-surface-200/50 uppercase tracking-widest">
+          Click each character once ({points.length} selected)
+        </div>
+        <div className="relative rounded-lg overflow-hidden border border-accent-500/50 cursor-crosshair">
+          <img
+            ref={imgRef}
+            src={`data:image/png;base64,${imageB64}`}
+            alt="Pick characters"
+            className="w-full h-auto object-contain select-none"
+            onClick={addPoint}
+            draggable={false}
+          />
+          {points.map(([x, y], i) => {
+            const img = imgRef.current
+            const left = img ? (x / img.naturalWidth) * 100 : 0
+            const top = img ? (y / img.naturalHeight) * 100 : 0
+            return (
+              <span
+                key={i}
+                className="absolute w-5 h-5 -ml-2.5 -mt-2.5 rounded-full bg-accent-500 border-2 border-white text-white text-[10px] font-bold flex items-center justify-center pointer-events-none shadow"
+                style={{ left: `${left}%`, top: `${top}%` }}
+              >
+                {i + 1}
+              </span>
+            )
+          })}
+        </div>
+        <div className="flex gap-2">
+          <button
+            id={`picker-apply-${idSuffix}`}
+            onClick={applyPoints}
+            disabled={points.length === 0}
+            className="flex-1 rounded-lg px-3 py-1.5 bg-accent-600 hover:bg-accent-500 text-white text-xs font-semibold transition-colors disabled:opacity-40"
+          >
+            Extract {points.length || ''} character{points.length === 1 ? '' : 's'}
+          </button>
+          <button
+            id={`picker-clear-${idSuffix}`}
+            onClick={() => setPoints([])}
+            disabled={points.length === 0}
+            className="rounded-lg px-3 py-1.5 glass border border-surface-500/40 text-surface-200/60 text-xs transition-colors hover:text-surface-200 disabled:opacity-40"
+          >
+            Clear
+          </button>
+          <button
+            id={`picker-cancel-${idSuffix}`}
+            onClick={() => { setPicking(false); setPoints([]) }}
+            className="rounded-lg px-3 py-1.5 glass border border-surface-500/40 text-surface-200/60 text-xs transition-colors hover:text-surface-200"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    )
+  }
+
   if (state.status === 'error') {
     return (
-      <div className="px-3 pb-3 text-xs text-red-400">
-        Layer split failed: {state.error}
+      <div className="px-3 pb-3 flex flex-col gap-2">
+        <div className="text-xs text-red-400">
+          Layer split failed: {state.error}
+        </div>
+        <PickButton idSuffix={idSuffix} onClick={() => { setPoints([]); setPicking(true) }} />
       </div>
     )
   }
@@ -88,9 +184,14 @@ export default function LayerResults({ state, baseName, idSuffix }: Props) {
 
   return (
     <div className="px-3 pb-3 flex flex-col gap-2" id={`layers-${idSuffix}`}>
-      <div className="text-[10px] text-surface-200/30 uppercase tracking-widest">
-        Layers · {state.layers.characters.length} character
-        {state.layers.characters.length === 1 ? '' : 's'} · {state.layers.processingMs.toFixed(0)} ms
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-[10px] text-surface-200/30 uppercase tracking-widest">
+          Layers · {state.layers.characters.length} character
+          {state.layers.characters.length === 1 ? '' : 's'}
+          {state.layers.splitMode === 'points' ? ' · manual' : ''}
+          {' · '}{state.layers.processingMs.toFixed(0)} ms
+        </div>
+        <PickButton idSuffix={idSuffix} onClick={() => { setPoints([]); setPicking(true) }} />
       </div>
       <div className="grid grid-cols-3 gap-2">
         {layers.map(layer => (
@@ -119,6 +220,32 @@ export default function LayerResults({ state, baseName, idSuffix }: Props) {
         ))}
       </div>
     </div>
+  )
+}
+
+function PickButton({ idSuffix, onClick }: { idSuffix: string | number; onClick: () => void }) {
+  return (
+    <button
+      id={`pick-characters-${idSuffix}`}
+      onClick={onClick}
+      className="text-[10px] text-accent-400 hover:text-accent-500 transition-colors flex items-center gap-1 flex-shrink-0"
+    >
+      <TargetIcon size={11} />
+      Pick characters
+    </button>
+  )
+}
+
+function TargetIcon({ size = 12 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="9" />
+      <circle cx="12" cy="12" r="3" />
+      <line x1="12" y1="1" x2="12" y2="5" />
+      <line x1="12" y1="19" x2="12" y2="23" />
+      <line x1="1" y1="12" x2="5" y2="12" />
+      <line x1="19" y1="12" x2="23" y2="12" />
+    </svg>
   )
 }
 

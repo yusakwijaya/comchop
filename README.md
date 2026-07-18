@@ -47,8 +47,8 @@ Cut coordinates are derived from the median of each detected gutter/line band, t
 
 Any panel can be split into layers via `POST /api/decompose` — either from the "Split layers" button on a panel card after a comic split, or by uploading already-cut panels directly with the **Layers only** mode toggle on the upload screen.
 
-- **Characters** — foreground extracted with the U2Net salient-object model (`rembg`; ~176 MB auto-downloaded to `~/.u2net`), then separated into individual characters with FastSAM instance segmentation (`ultralytics`; ~23 MB auto-downloaded). Both run locally on CPU. Returns one RGBA PNG per character, ordered left to right; falls back to connected-component splitting if FastSAM finds no usable instances.
-- **Speech bubbles** — classical CV in `backend/app/services/decomposer.py`: bright, convex contours containing text-like dark pixels
+- **Characters** — for line-art panels the foreground is found by flood-filling from the panel borders through non-ink pixels (median blur first so halftone dots don't block the flood; ink outlines do). Everything enclosed by outlines is content; pale colour washes flood away to the background. U2Net (`rembg`; ~176 MB auto-downloaded to `~/.u2net`) supplements the flood and takes over entirely on photo-style panels. Content is then split into individual characters: automatically (connected components, refined by FastSAM instance segmentation — `ultralytics`, ~23 MB auto-downloaded) or manually via the **Pick characters** button, where one click per character drives a FastSAM point prompt. Manual mode is the reliable path for overlapping characters. All models run locally on CPU.
+- **Speech bubbles** — classical CV in `backend/app/services/decomposer.py`: bright, convex, ink-enclosed blobs whose interiors hold several stroke-like dark components (text). The stroke-shape test keeps cartoon eyes (round pupils) out of the bubble layer.
 - **Background** — the panel with both layers removed and the holes filled with OpenCV Telea inpainting
 
 Characters and bubbles are returned as transparent RGBA PNGs, the background as an opaque inpainted PNG.

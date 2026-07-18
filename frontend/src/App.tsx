@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef } from 'react'
 import ComicUploader from './components/ComicUploader'
 import PanelGrid, { Panel } from './components/PanelGrid'
-import LayerResults, { LayersState, decomposeImage } from './components/LayerResults'
+import LayerResults, { LayersState, Point, decomposeImage } from './components/LayerResults'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface ComicSplitResult {
@@ -105,6 +105,21 @@ export default function App() {
       }
       setDirectItems(prev => prev.map((it, j) => (j === i ? { ...it, layers } : it)))
     }
+  }, [])
+
+  const redecomposeDirect = useCallback(async (index: number, b64: string, points?: Point[]) => {
+    setDirectItems(prev => prev.map((it, j) =>
+      j === index ? { ...it, layers: { status: 'loading' } } : it))
+    let layers: LayersState
+    try {
+      layers = { status: 'done', layers: await decomposeImage(b64, points) }
+    } catch (err) {
+      layers = {
+        status: 'error',
+        error: err instanceof Error ? err.message : 'Unknown error',
+      }
+    }
+    setDirectItems(prev => prev.map((it, j) => (j === index ? { ...it, layers } : it)))
   }, [])
 
   const handleSplitUpload = useCallback(async (files: File[]) => {
@@ -314,6 +329,8 @@ export default function App() {
                   state={item.layers}
                   baseName={item.filename.replace(/\.[^.]+$/, '')}
                   idSuffix={`direct-${i}`}
+                  imageB64={item.b64}
+                  onDecompose={(points) => redecomposeDirect(i, item.b64, points)}
                 />
               </div>
             ))}
