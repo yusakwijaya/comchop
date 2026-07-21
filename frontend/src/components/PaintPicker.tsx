@@ -7,6 +7,44 @@ const BUBBLE_ID = 90
 const BUBBLE_COLOR = '#38bdf8'
 const MAX_HISTORY = 40
 
+type Tool = 'brush' | 'bucket'
+
+/**
+ * 3x3 median filter over RGB. Comic line art is full of halftone dot
+ * screens; a raw flood fill stops at every dot. Median removes isolated
+ * specks while leaving ink outlines (which are thick and contiguous)
+ * intact, so the bucket fills a shaded region but still stops at edges.
+ */
+function medianSmooth(src: Uint8ClampedArray, w: number, h: number): Uint8Array {
+  const out = new Uint8Array(w * h * 3)
+  const win = new Uint8Array(9)
+  for (let c = 0; c < 3; c++) {
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let n = 0
+        for (let dy = -1; dy <= 1; dy++) {
+          const yy = y + dy
+          if (yy < 0 || yy >= h) continue
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx
+            if (xx < 0 || xx >= w) continue
+            win[n++] = src[(yy * w + xx) * 4 + c]
+          }
+        }
+        // Insertion sort — n is at most 9.
+        for (let i = 1; i < n; i++) {
+          const v = win[i]
+          let j = i - 1
+          while (j >= 0 && win[j] > v) { win[j + 1] = win[j]; j-- }
+          win[j + 1] = v
+        }
+        out[(y * w + x) * 3 + c] = win[n >> 1]
+      }
+    }
+  }
+  return out
+}
+
 interface Category {
   id: number
   label: string
@@ -62,12 +100,17 @@ export default function PaintPicker({ imageB64, initialLayers, onApply, onCancel
   // Last point painted (natural image coords) — Photoshop-style shift+click
   // paints a straight line from here to the new click point.
   const lastPointRef = useRef<{ x: number; y: number } | null>(null)
+  // Median-smoothed copy of the panel, built lazily on first bucket use
+  // and reused for every later fill.
+  const smoothedRef = useRef<Uint8Array | null>(null)
 
   const [ready, setReady] = useState(false)
   const [categories, setCategories] = useState<Category[]>([
     { id: 1, label: 'Character 1', color: CHAR_COLORS[0] },
   ])
   const [activeId, setActiveId] = useState(1)
+  const [tool, setTool] = useState<Tool>('brush')
+  const [tolerance, setTolerance] = useState(40)
   const [brushRadius, setBrushRadius] = useState(24)
   const [bgColor, setBgColor] = useState('#ffffff')
   const [paintedIds, setPaintedIds] = useState<Set<number>>(new Set())
@@ -244,10 +287,108 @@ export default function PaintPicker({ imageB64, initialLayers, onApply, onCancel
     }
   }, [])
 
+  const recomputePaintedIds = useCallback(() => {
+    const ownerMap = ownerMapRef.current
+    if (!ownerMap) return
+    const ids = new Set<number>()
+    for (let i = 0; i < ownerMap.length; i++) {
+      if (ownerMap[i] !== 0) ids.add(ownerMap[i])
+    }
+    setPaintedIds(ids)
+  }, [])
+
+  const pushHistory = useCallback(() => {
+    const ownerMap = ownerMapRef.current
+    if (!ownerMap) return
+    const stack = undoStackRef.current
+    stack.push(ownerMap.slice())
+    if (stack.length > MAX_HISTORY) stack.shift()
+    redoStackRef.current = []
+    setUndoCount(stack.length)
+    setRedoCount(0)
+  }, [])
+
+  /**
+   * Bucket fill: claim every pixel reachable from (sx, sy) whose colour
+   * stays within `tolerance` of the clicked colour. Runs on the
+   * median-smoothed copy so halftone dots don't stop the flood, while
+   * ink outlines still bound it.
+   */
+  const bucketFill = useCallback((sx: number, sy: number, categoryId: number) => {
+    const { w, h } = sizeRef.current
+    const ownerMap = ownerMapRef.current
+    const orig = origDataRef.current
+    const overlay = overlayDataRef.current
+    if (!ownerMap || !orig || !overlay) return
+
+    const x0 = Math.floor(sx), y0 = Math.floor(sy)
+    if (x0 < 0 || y0 < 0 || x0 >= w || y0 >= h) return
+
+    if (!smoothedRef.current) {
+      smoothedRef.current = medianSmooth(orig.data, w, h)
+    }
+    const sm = smoothedRef.current
+
+    const start = (y0 * w + x0) * 3
+    const tr = sm[start], tg = sm[start + 1], tb = sm[start + 2]
+    const tol = tolerance
+
+    const cat = categoryById(categoryId)
+    const color = cat ? hexToRgb(cat.color) : null
+
+    // Scanline flood fill — far fewer queue operations than per-pixel
+    // 4-way flooding over the large flat regions typical of comic art.
+    const seen = new Uint8Array(w * h)
+    const match = (x: number, y: number): boolean => {
+      const i = y * w + x
+      if (seen[i]) return false
+      const o = i * 3
+      return Math.abs(sm[o] - tr) <= tol
+        && Math.abs(sm[o + 1] - tg) <= tol
+        && Math.abs(sm[o + 2] - tb) <= tol
+    }
+
+    // Nothing to do if the click can't even seed a fill.
+    if (!match(x0, y0)) return
+    pushHistory()
+
+    const stack: number[] = [x0, y0]
+    while (stack.length) {
+      const y = stack.pop()!
+      let x = stack.pop()!
+      if (!match(x, y)) continue
+
+      let left = x
+      while (left > 0 && match(left - 1, y)) left--
+      let right = x
+      while (right < w - 1 && match(right + 1, y)) right++
+
+      for (x = left; x <= right; x++) {
+        const i = y * w + x
+        seen[i] = 1
+        ownerMap[i] = categoryId
+        blendPixel(i, orig.data, overlay.data, color, 0.5)
+        if (y > 0 && match(x, y - 1)) stack.push(x, y - 1)
+        if (y < h - 1 && match(x, y + 1)) stack.push(x, y + 1)
+      }
+    }
+
+    recomputePaintedIds()
+    lastPointRef.current = { x: sx, y: sy }
+    scheduleRedraw()
+  }, [tolerance, categoryById, recomputePaintedIds, scheduleRedraw, pushHistory])
+
   const onMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const { x, y } = toImageCoords(e)
+
+    if (tool === 'bucket') {
+      // A fill is one discrete action — never the start of a drag.
+      bucketFill(x, y, activeId)
+      return
+    }
+
     paintingRef.current = true
     strokeSnapshotTakenRef.current = false
-    const { x, y } = toImageCoords(e)
     if (e.shiftKey && lastPointRef.current) {
       const { x: lx, y: ly } = lastPointRef.current
       paintLine(lx, ly, x, y, activeId)
@@ -257,7 +398,7 @@ export default function PaintPicker({ imageB64, initialLayers, onApply, onCancel
     } else {
       paintAt(x, y, activeId)
     }
-  }, [toImageCoords, paintAt, paintLine, activeId])
+  }, [toImageCoords, paintAt, paintLine, bucketFill, tool, activeId])
 
   const onMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const { x, y, displayX, displayY, scale } = toImageCoords(e)
@@ -288,27 +429,6 @@ export default function PaintPicker({ imageB64, initialLayers, onApply, onCancel
     }
     scheduleRedraw()
   }, [categoryById, scheduleRedraw])
-
-  const recomputePaintedIds = useCallback(() => {
-    const ownerMap = ownerMapRef.current
-    if (!ownerMap) return
-    const ids = new Set<number>()
-    for (let i = 0; i < ownerMap.length; i++) {
-      if (ownerMap[i] !== 0) ids.add(ownerMap[i])
-    }
-    setPaintedIds(ids)
-  }, [])
-
-  const pushHistory = useCallback(() => {
-    const ownerMap = ownerMapRef.current
-    if (!ownerMap) return
-    const stack = undoStackRef.current
-    stack.push(ownerMap.slice())
-    if (stack.length > MAX_HISTORY) stack.shift()
-    redoStackRef.current = []
-    setUndoCount(stack.length)
-    setRedoCount(0)
-  }, [])
 
   const restoreSnapshot = useCallback((snapshot: Uint8Array) => {
     const ownerMap = ownerMapRef.current
@@ -454,7 +574,35 @@ export default function PaintPicker({ imageB64, initialLayers, onApply, onCancel
         Paint each layer, then extract
       </div>
       <div className="text-[10px] text-surface-200/30 -mt-1">
-        Tip: hold Shift and click to draw a straight line from your last stroke
+        {tool === 'brush'
+          ? 'Tip: hold Shift and click to draw a straight line from your last stroke'
+          : 'Tip: click inside an outlined area to fill it — raise Tolerance if the fill stops too early'}
+      </div>
+
+      {/* Tool picker */}
+      <div className="flex items-center gap-1.5">
+        <button
+          id="paint-tool-brush"
+          onClick={() => setTool('brush')}
+          className={`text-[10px] rounded-lg px-2.5 py-1 border transition-colors ${
+            tool === 'brush'
+              ? 'bg-accent-600 border-accent-500 text-white'
+              : 'glass border-surface-500/40 text-surface-200/60 hover:text-surface-200'
+          }`}
+        >
+          Brush
+        </button>
+        <button
+          id="paint-tool-bucket"
+          onClick={() => setTool('bucket')}
+          className={`text-[10px] rounded-lg px-2.5 py-1 border transition-colors ${
+            tool === 'bucket'
+              ? 'bg-accent-600 border-accent-500 text-white'
+              : 'glass border-surface-500/40 text-surface-200/60 hover:text-surface-200'
+          }`}
+        >
+          Bucket
+        </button>
       </div>
 
       {/* Category chips */}
@@ -497,13 +645,15 @@ export default function PaintPicker({ imageB64, initialLayers, onApply, onCancel
       <div className="relative rounded-lg overflow-hidden border border-accent-500/50">
         <canvas
           ref={canvasRef}
-          className="w-full h-auto block cursor-none select-none"
+          className={`w-full h-auto block select-none ${
+            tool === 'bucket' ? 'cursor-crosshair' : 'cursor-none'
+          }`}
           onMouseDown={onMouseDown}
           onMouseMove={onMouseMove}
           onMouseUp={stopPainting}
           onMouseLeave={hideCursor}
         />
-        {cursor && (
+        {cursor && tool === 'brush' && (
           <div
             className="absolute rounded-full border-2 pointer-events-none"
             style={{
@@ -546,14 +696,28 @@ export default function PaintPicker({ imageB64, initialLayers, onApply, onCancel
             <UndoIcon size={13} flip />
           </button>
         </div>
-        <label className="flex items-center gap-2 text-[10px] text-surface-200/60">
-          Brush
-          <input
-            type="range" min={4} max={100} value={brushRadius}
-            onChange={e => setBrushRadius(Number(e.target.value))}
-            className="w-20 accent-accent-500"
-          />
-        </label>
+        {tool === 'brush' ? (
+          <label className="flex items-center gap-2 text-[10px] text-surface-200/60">
+            Brush
+            <input
+              id="paint-brush-size"
+              type="range" min={4} max={100} value={brushRadius}
+              onChange={e => setBrushRadius(Number(e.target.value))}
+              className="w-20 accent-accent-500"
+            />
+          </label>
+        ) : (
+          <label className="flex items-center gap-2 text-[10px] text-surface-200/60">
+            Tolerance
+            <input
+              id="paint-tolerance"
+              type="range" min={0} max={120} value={tolerance}
+              onChange={e => setTolerance(Number(e.target.value))}
+              className="w-20 accent-accent-500"
+            />
+            <span className="font-mono text-surface-200/40 w-6">{tolerance}</span>
+          </label>
+        )}
         <label className="flex items-center gap-2 text-[10px] text-surface-200/60">
           Background fill
           <input
