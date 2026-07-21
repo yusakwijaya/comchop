@@ -15,11 +15,39 @@ interface Category {
 
 interface Props {
   imageB64: string
+  /**
+   * Existing layer result (e.g. from the automatic ML decompose) to
+   * pre-fill the paint as a starting point — the user then corrects it
+   * with the brush instead of painting everything from scratch. Each
+   * layer's alpha channel is read back as that category's painted mask.
+   */
+  initialLayers?: { characters: string[]; bubbles: string }
   onApply: (layers: LayerSet) => void
   onCancel: () => void
 }
 
-export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
+/** Decode a base64 RGBA PNG and claim its opaque pixels into ownerMap. */
+async function claimLayerAlpha(
+  b64: string, categoryId: number, ownerMap: Uint8Array, w: number, h: number,
+): Promise<void> {
+  const img = new Image()
+  await new Promise<void>(resolve => {
+    img.onload = () => resolve()
+    img.onerror = () => resolve()
+    img.src = `data:image/png;base64,${b64}`
+  })
+  if (!img.naturalWidth) return
+  const c = document.createElement('canvas')
+  c.width = w; c.height = h
+  const ctx = c.getContext('2d')!
+  ctx.drawImage(img, 0, 0, w, h)
+  const data = ctx.getImageData(0, 0, w, h).data
+  for (let i = 0; i < w * h; i++) {
+    if (data[i * 4 + 3] > 127) ownerMap[i] = categoryId
+  }
+}
+
+export default function PaintPicker({ imageB64, initialLayers, onApply, onCancel }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const ownerMapRef = useRef<Uint8Array | null>(null)
   const origDataRef = useRef<ImageData | null>(null)
@@ -50,7 +78,7 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
   // ── Load image into canvas ────────────────────────────────────────────
   useEffect(() => {
     const img = new Image()
-    img.onload = () => {
+    img.onload = async () => {
       const canvas = canvasRef.current
       if (!canvas) return
       const w = img.naturalWidth
@@ -65,11 +93,46 @@ export default function PaintPicker({ imageB64, onApply, onCancel }: Props) {
       overlayDataRef.current = new ImageData(
         new Uint8ClampedArray(orig.data), w, h,
       )
-      ownerMapRef.current = new Uint8Array(w * h)
+      const ownerMap = new Uint8Array(w * h)
+      ownerMapRef.current = ownerMap
       setBrushRadius(Math.max(8, Math.round(Math.min(w, h) / 20)))
+
+      // Pre-fill from an existing result so the user corrects it with the
+      // brush rather than repainting everything from scratch.
+      if (initialLayers) {
+        for (let i = 0; i < initialLayers.characters.length; i++) {
+          await claimLayerAlpha(initialLayers.characters[i], i + 1, ownerMap, w, h)
+        }
+        await claimLayerAlpha(initialLayers.bubbles, BUBBLE_ID, ownerMap, w, h)
+
+        const n = Math.max(1, initialLayers.characters.length)
+        setCategories(Array.from({ length: n }, (_, i) => ({
+          id: i + 1,
+          label: `Character ${i + 1}`,
+          color: CHAR_COLORS[i % CHAR_COLORS.length],
+        })))
+
+        const ids = new Set<number>()
+        const overlay = overlayDataRef.current!.data
+        for (let i = 0; i < w * h; i++) {
+          const id = ownerMap[i]
+          if (id === 0) continue
+          ids.add(id)
+          const hex = id === BUBBLE_ID
+            ? BUBBLE_COLOR
+            : CHAR_COLORS[(id - 1) % CHAR_COLORS.length]
+          blendPixel(i, orig.data, overlay, hexToRgb(hex), 0.5)
+        }
+        setPaintedIds(ids)
+        ctx.putImageData(overlayDataRef.current!, 0, 0)
+      }
+
       setReady(true)
     }
     img.src = `data:image/png;base64,${imageB64}`
+    // The picker unmounts whenever it closes, so this runs once per open;
+    // initialLayers is captured at mount and intentionally not a dep.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [imageB64])
 
   const categoryById = useCallback((id: number): Category | undefined => {
