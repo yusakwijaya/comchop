@@ -107,6 +107,7 @@ export default function LayerResults({
     return (
       <PaintPicker
         imageB64={imageB64}
+        initialLayers={state.status === 'done' ? state.layers : undefined}
         onApply={applyPaint}
         onCancel={() => setPainting(false)}
       />
